@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
+import 'package:barcode_widget/barcode_widget.dart' as barcode_ui;
 import 'package:file_picker/file_picker.dart';
 import 'package:flex_color_scheme/flex_color_scheme.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -54,6 +56,14 @@ Map<String, String> resourceQueryFor(String path, String branchId) {
       path.endsWith('/other-income')) {
     final range = riyadhDateRange(days: 30);
     return {'branchId': branchId, 'from': range.from, 'to': range.to};
+  }
+  if (path.contains('/session-slots')) {
+    final now = DateTime.now().toUtc();
+    return {
+      'branchId': branchId,
+      'from': now.toIso8601String(),
+      'to': now.add(const Duration(days: 30)).toIso8601String(),
+    };
   }
   if (path.startsWith('/self/') &&
       (path.endsWith('/services') ||
@@ -191,7 +201,10 @@ class ApiClient {
       persistedHeaders.putIfAbsent('Idempotency-Key', _requestId);
     }
     final token = await secure.read(key: 'go_access_token');
-    final uri = Uri.parse('$baseUrl$path').replace(queryParameters: query);
+    final parsedUri = Uri.parse('$baseUrl$path');
+    final uri = parsedUri.replace(
+      queryParameters: {...parsedUri.queryParameters, ...?query},
+    );
     final headers = <String, String>{
       'Accept': 'application/json',
       'Content-Type': 'application/json',
@@ -513,7 +526,9 @@ class ApiClient {
     final data = await request(
       path
           .replaceAll('{organizationId}', organizationId)
-          .replaceAll('{memberId}', memberId ?? ''),
+          .replaceAll('{memberId}', memberId ?? '')
+          .replaceAll('{branchId}', branchId)
+          .replaceAll('{businessDate}', riyadhBusinessDate()),
       query: query,
     );
     if (data is List) {
@@ -763,6 +778,8 @@ enum WorkflowFieldType {
   textarea,
   select,
   reference,
+  multiReference,
+  checkbox,
 }
 
 class WorkflowChoice {
@@ -785,6 +802,8 @@ class WorkflowField {
     this.copyValues = const {},
     this.visibleWhenField,
     this.visibleWhenValues = const [],
+    this.autoFillDate = true,
+    this.allowZero = false,
   });
   final String name;
   final String label;
@@ -798,6 +817,8 @@ class WorkflowField {
   final Map<String, String> copyValues;
   final String? visibleWhenField;
   final List<String> visibleWhenValues;
+  final bool autoFillDate;
+  final bool allowZero;
 }
 
 typedef WorkflowBodyBuilder = Map<String, dynamic> Function(
@@ -916,9 +937,34 @@ final mobileWorkflows = <MobileWorkflow>[
         required: true,
         initialValue: 'CARD',
         choices: [
+          WorkflowChoice('CASH', 'نقدي'),
           WorkflowChoice('CARD', 'بطاقة بنكية'),
           WorkflowChoice('BANK_TRANSFER', 'تحويل بنكي'),
+          WorkflowChoice('GATEWAY', 'بوابة دفع'),
+          WorkflowChoice('WALLET', 'محفظة إلكترونية'),
         ],
+      ),
+      WorkflowField(
+        name: 'cashierShiftId',
+        label: 'وردية الصندوق المفتوحة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/cashier-shifts',
+        labelKeys: ['cashPointName', 'cashierName'],
+        subtitleKeys: ['openedAt', 'status'],
+        visibleWhenField: 'method',
+        visibleWhenValues: ['CASH'],
+      ),
+      WorkflowField(
+        name: 'cashPointId',
+        label: 'نقطة الصندوق',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/cash-points',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+        visibleWhenField: 'method',
+        visibleWhenValues: ['CASH'],
       ),
       WorkflowField(name: 'externalReference', label: 'مرجع الدفع'),
     ],
@@ -933,8 +979,140 @@ final mobileWorkflows = <MobileWorkflow>[
         'allocations': [
           {'invoiceId': values['invoiceId'], 'amountMinor': minor},
         ],
+        if (values['method'] == 'CASH') ...{
+          'cashierShiftId': values['cashierShiftId'],
+          'cashPointId': values['cashPointId'],
+        },
         if (values['externalReference']?.isNotEmpty == true)
           'externalReference': values['externalReference'],
+      };
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'recordSplitPayment',
+    title: 'تحصيل مقسّم',
+    description: 'قسّم تحصيل فاتورة واحدة بين وسيلتي دفع. يجب أن يساوي مجموع الجزأين الرصيد المستحق.',
+    submitLabel: 'تسجيل جزأي الدفع',
+    successMessage: 'تم تسجيل التحصيل المقسّم وتحديث الفاتورة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/payments',
+    icon: Icons.call_split_rounded,
+    fields: [
+      WorkflowField(
+        name: 'invoiceId',
+        label: 'الفاتورة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/invoices',
+        labelKeys: ['invoiceNumber', 'number'],
+        subtitleKeys: ['buyerName', 'outstandingMinor'],
+      ),
+      WorkflowField(
+        name: 'firstAmount',
+        label: 'مبلغ الجزء الأول (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'firstMethod',
+        label: 'وسيلة الجزء الأول',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'CARD',
+        choices: [
+          WorkflowChoice('CASH', 'نقدي'),
+          WorkflowChoice('CARD', 'بطاقة بنكية'),
+          WorkflowChoice('BANK_TRANSFER', 'تحويل بنكي'),
+          WorkflowChoice('GATEWAY', 'بوابة دفع'),
+          WorkflowChoice('WALLET', 'محفظة إلكترونية'),
+        ],
+      ),
+      WorkflowField(
+        name: 'firstCashierShiftId',
+        label: 'وردية الجزء النقدي الأول',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/cashier-shifts',
+        labelKeys: ['cashPointName', 'cashierName'],
+        subtitleKeys: ['openedAt', 'status'],
+        visibleWhenField: 'firstMethod',
+        visibleWhenValues: ['CASH'],
+      ),
+      WorkflowField(
+        name: 'firstCashPointId',
+        label: 'نقطة صندوق الجزء الأول',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/cash-points',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+        visibleWhenField: 'firstMethod',
+        visibleWhenValues: ['CASH'],
+      ),
+      WorkflowField(name: 'firstReference', label: 'مرجع الجزء الأول'),
+      WorkflowField(
+        name: 'secondAmount',
+        label: 'مبلغ الجزء الثاني (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'secondMethod',
+        label: 'وسيلة الجزء الثاني',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'BANK_TRANSFER',
+        choices: [
+          WorkflowChoice('CASH', 'نقدي'),
+          WorkflowChoice('CARD', 'بطاقة بنكية'),
+          WorkflowChoice('BANK_TRANSFER', 'تحويل بنكي'),
+          WorkflowChoice('GATEWAY', 'بوابة دفع'),
+          WorkflowChoice('WALLET', 'محفظة إلكترونية'),
+        ],
+      ),
+      WorkflowField(
+        name: 'secondCashierShiftId',
+        label: 'وردية الجزء النقدي الثاني',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/cashier-shifts',
+        labelKeys: ['cashPointName', 'cashierName'],
+        subtitleKeys: ['openedAt', 'status'],
+        visibleWhenField: 'secondMethod',
+        visibleWhenValues: ['CASH'],
+      ),
+      WorkflowField(
+        name: 'secondCashPointId',
+        label: 'نقطة صندوق الجزء الثاني',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/cash-points',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+        visibleWhenField: 'secondMethod',
+        visibleWhenValues: ['CASH'],
+      ),
+      WorkflowField(name: 'secondReference', label: 'مرجع الجزء الثاني'),
+    ],
+    body: (values, controller) {
+      final firstMinor = _moneyMinor(values['firstAmount']);
+      final secondMinor = _moneyMinor(values['secondAmount']);
+      Map<String, dynamic> part(String prefix, String amountMinor) => {
+        'method': values['${prefix}Method'],
+        'amountMinor': amountMinor,
+        'allocations': [
+          {'invoiceId': values['invoiceId'], 'amountMinor': amountMinor},
+        ],
+        if (values['${prefix}Method'] == 'CASH') ...{
+          'cashierShiftId': values['${prefix}CashierShiftId'],
+          'cashPointId': values['${prefix}CashPointId'],
+        } else if (values['${prefix}Reference']?.trim().isNotEmpty == true)
+          'externalReference': values['${prefix}Reference']?.trim(),
+      };
+
+      return {
+        'collectionBranchId': controller.branchId,
+        'parts': [part('first', firstMinor), part('second', secondMinor)],
       };
     },
   ),
@@ -1237,6 +1415,110 @@ final mobileWorkflows = <MobileWorkflow>[
     },
   ),
   MobileWorkflow(
+    operationId: 'checkoutServiceAtPos',
+    title: 'بيع خدمة',
+    description: 'اختر العضو والخدمة والكمية؛ سيُنشئ النظام طلب البيع والفاتورة بالسعر النشط في الفرع.',
+    submitLabel: 'إنشاء طلب الخدمة',
+    successMessage: 'تم إنشاء طلب الخدمة والفاتورة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/orders',
+    icon: Icons.sports_gymnastics_outlined,
+    fields: [
+      WorkflowField(
+        name: 'memberId',
+        label: 'العضو',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber'],
+      ),
+      WorkflowField(
+        name: 'serviceId',
+        label: 'الخدمة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/services',
+        labelKeys: ['name', 'nameAr'],
+        subtitleKeys: ['categoryName', 'code'],
+      ),
+      WorkflowField(
+        name: 'quantity',
+        label: 'الكمية',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '1',
+      ),
+      WorkflowField(name: 'promoCode', label: 'كود الخصم (اختياري)'),
+    ],
+    body: (values, controller) => {
+      'sellingBranchId': controller.branchId,
+      'memberId': values['memberId'],
+      'memberSegment': 'OTHER',
+      'lines': [
+        {
+          'type': 'SERVICE',
+          'targetId': values['serviceId'],
+          'quantity': int.tryParse(values['quantity'] ?? '') ?? 1,
+          if (values['promoCode']?.trim().isNotEmpty == true)
+            'promoCode': values['promoCode']?.trim().toUpperCase(),
+        },
+      ],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'checkoutRetailAtPos',
+    title: 'بيع منتج من المتجر',
+    description: 'اختر المنتج والكمية والعضو عند الحاجة؛ سيُخصم المخزون ويصدر الطلب والفاتورة تلقائيًا.',
+    submitLabel: 'إتمام بيع المنتج',
+    successMessage: 'تم تسجيل بيع المنتج وإصدار الفاتورة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/orders',
+    icon: Icons.shopping_bag_outlined,
+    fields: [
+      WorkflowField(
+        name: 'memberId',
+        label: 'العضو (اختياري)',
+        type: WorkflowFieldType.reference,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber'],
+      ),
+      WorkflowField(
+        name: 'productId',
+        label: 'المنتج',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/retail/products',
+        labelKeys: ['name', 'nameAr'],
+        subtitleKeys: ['sku', 'code'],
+      ),
+      WorkflowField(
+        name: 'quantity',
+        label: 'الكمية',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '1',
+      ),
+      WorkflowField(name: 'promoCode', label: 'كود الخصم (اختياري)'),
+    ],
+    body: (values, controller) => {
+      'sellingBranchId': controller.branchId,
+      if (values['memberId']?.isNotEmpty == true)
+        'memberId': values['memberId'],
+      'memberSegment': 'OTHER',
+      'lines': [
+        {
+          'type': 'RETAIL',
+          'targetId': values['productId'],
+          'quantity': int.tryParse(values['quantity'] ?? '') ?? 1,
+          if (values['promoCode']?.trim().isNotEmpty == true)
+            'promoCode': values['promoCode']?.trim().toUpperCase(),
+        },
+      ],
+    },
+  ),
+  MobileWorkflow(
     operationId: 'createManualReservation',
     title: 'حجز جديد',
     description: 'اختر العميل والمورد والموعد. يطابق التطبيق نوع المورد وخدمته تلقائيًا قبل الإرسال.',
@@ -1502,6 +1784,90 @@ final mobileWorkflows = <MobileWorkflow>[
     },
   ),
   MobileWorkflow(
+    operationId: 'createSelfTrainerTrainingPlan',
+    title: 'إنشاء خطة تدريب للمتدرب',
+    description: 'اختر أحد المتدربين المسندين إليك وابدأ الخطة بتمرين واضح؛ يمكنك إنشاء تمارين إضافية ضمن خطط لاحقة.',
+    submitLabel: 'إنشاء الخطة',
+    successMessage: 'تم إنشاء خطة التدريب وإتاحتها للعضو.',
+    method: 'POST',
+    path: '/self/organizations/{organizationId}/trainer/training-plans',
+    icon: Icons.playlist_add_check_circle_outlined,
+    fields: [
+      WorkflowField(
+        name: 'memberId',
+        label: 'المتدرب',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/self/organizations/{organizationId}/trainer/members',
+        labelKeys: ['memberName', 'name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber', 'branchName'],
+      ),
+      WorkflowField(name: 'name', label: 'اسم الخطة', required: true),
+      WorkflowField(
+        name: 'goal',
+        label: 'هدف الخطة',
+        type: WorkflowFieldType.textarea,
+      ),
+      WorkflowField(
+        name: 'startsOn',
+        label: 'تاريخ البداية',
+        type: WorkflowFieldType.date,
+        required: true,
+      ),
+      const WorkflowField(
+        name: 'endsOn',
+        label: 'تاريخ النهاية (اختياري)',
+        type: WorkflowFieldType.date,
+        autoFillDate: false,
+      ),
+      WorkflowField(
+        name: 'exerciseName',
+        label: 'اسم التمرين الأول',
+        required: true,
+      ),
+      WorkflowField(
+        name: 'sets',
+        label: 'عدد المجموعات',
+        type: WorkflowFieldType.number,
+      ),
+      WorkflowField(name: 'repetitions', label: 'التكرارات'),
+      WorkflowField(
+        name: 'durationMinutes',
+        label: 'المدة بالدقائق',
+        type: WorkflowFieldType.number,
+      ),
+      WorkflowField(
+        name: 'instructions',
+        label: 'تعليمات التنفيذ',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'memberId': values['memberId'],
+      'name': values['name']?.trim(),
+      if (values['goal']?.trim().isNotEmpty == true)
+        'goal': values['goal']?.trim(),
+      'startsOn': values['startsOn'],
+      if (values['endsOn']?.isNotEmpty == true) 'endsOn': values['endsOn'],
+      'items': [
+        {
+          'dayNumber': 1,
+          'sequenceNumber': 1,
+          'exerciseName': values['exerciseName']?.trim(),
+          if (values['sets']?.isNotEmpty == true)
+            'sets': int.tryParse(values['sets']!),
+          if (values['repetitions']?.trim().isNotEmpty == true)
+            'repetitions': values['repetitions']?.trim(),
+          if (values['durationMinutes']?.isNotEmpty == true)
+            'durationMinutes': int.tryParse(values['durationMinutes']!),
+          if (values['instructions']?.trim().isNotEmpty == true)
+            'instructions': values['instructions']?.trim(),
+        },
+      ],
+    },
+  ),
+  MobileWorkflow(
     operationId: 'recordMeasurementSession',
     title: 'تسجيل جلسة قياس',
     description: 'اختر العضو ونوع القياس وسجّل القيمة في ملفه الصحي.',
@@ -1633,12 +1999,2380 @@ final mobileWorkflows = <MobileWorkflow>[
       'branchId': controller.branchId,
     },
   ),
+  MobileWorkflow(
+    operationId: 'createBranch',
+    title: 'إضافة فرع',
+    description: 'أضف فرعًا جديدًا للنادي ببيانات التشغيل والتوقيت المحلي.',
+    submitLabel: 'حفظ الفرع',
+    successMessage: 'تمت إضافة الفرع بنجاح.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/branches',
+    icon: Icons.add_business_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز الفرع', required: true),
+      WorkflowField(name: 'name', label: 'اسم الفرع', required: true),
+      WorkflowField(
+        name: 'timezone',
+        label: 'المنطقة الزمنية',
+        initialValue: 'Asia/Riyadh',
+      ),
+      WorkflowField(
+        name: 'address',
+        label: 'العنوان',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      if (values['timezone']?.trim().isNotEmpty == true)
+        'timezone': values['timezone']?.trim(),
+      if (values['address']?.trim().isNotEmpty == true)
+        'address': values['address']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createActivity',
+    title: 'إضافة نشاط',
+    description: 'عرّف نشاطًا رياضيًا جديدًا لربطه بالخدمات والمرافق.',
+    submitLabel: 'إضافة النشاط',
+    successMessage: 'تمت إضافة النشاط.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/activities',
+    icon: Icons.directions_run_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز النشاط', required: true),
+      WorkflowField(name: 'name', label: 'اسم النشاط', required: true),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createServiceCategory',
+    title: 'إضافة تصنيف خدمات',
+    description: 'أضف تصنيفًا يسهّل تنظيم خدمات النادي.',
+    submitLabel: 'حفظ التصنيف',
+    successMessage: 'تمت إضافة تصنيف الخدمات.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/service-categories',
+    icon: Icons.category_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز التصنيف', required: true),
+      WorkflowField(name: 'name', label: 'اسم التصنيف', required: true),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createService',
+    title: 'إضافة خدمة',
+    description: 'عرّف الخدمة وتصنيفها والأنشطة المرتبطة بها.',
+    submitLabel: 'إضافة الخدمة',
+    successMessage: 'تمت إضافة الخدمة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/services',
+    icon: Icons.sports_gymnastics_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز الخدمة', required: true),
+      WorkflowField(name: 'name', label: 'اسم الخدمة', required: true),
+      WorkflowField(
+        name: 'categoryId',
+        label: 'تصنيف الخدمة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/service-categories',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'activityIds',
+        label: 'الأنشطة',
+        type: WorkflowFieldType.multiReference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/activities',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'fulfillmentKind',
+        label: 'نوع التنفيذ',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'FACILITY_ACCESS',
+        choices: [
+          WorkflowChoice('FACILITY_ACCESS', 'دخول مرفق'),
+          WorkflowChoice('SESSION', 'جلسة'),
+          WorkflowChoice('MEAL_PLAN', 'خطة وجبات'),
+        ],
+      ),
+      WorkflowField(
+        name: 'description',
+        label: 'الوصف',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      'categoryId': values['categoryId'],
+      'activityIds': _selectedValues(values['activityIds']),
+      'fulfillmentKind': values['fulfillmentKind'],
+      if (values['description']?.trim().isNotEmpty == true)
+        'description': values['description']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createCashPoint',
+    title: 'إضافة نقطة تحصيل',
+    description: 'أضف صندوقًا أو نقطة بيع للفرع الحالي.',
+    submitLabel: 'حفظ نقطة التحصيل',
+    successMessage: 'تمت إضافة نقطة التحصيل.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/cash-points',
+    icon: Icons.point_of_sale_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز نقطة التحصيل', required: true),
+      WorkflowField(name: 'name', label: 'اسم نقطة التحصيل', required: true),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createLocker',
+    title: 'إضافة خزانة',
+    description: 'أضف خزانة جديدة إلى الفرع الحالي.',
+    submitLabel: 'حفظ الخزانة',
+    successMessage: 'تمت إضافة الخزانة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/lockers',
+    icon: Icons.door_sliding_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز الخزانة', required: true),
+      WorkflowField(
+        name: 'lockerType',
+        label: 'نوع الخزانة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'STANDARD',
+        choices: [
+          WorkflowChoice('STANDARD', 'عادية'),
+          WorkflowChoice('LARGE', 'كبيرة'),
+          WorkflowChoice('VALUABLES', 'مقتنيات ثمينة'),
+        ],
+      ),
+      WorkflowField(
+        name: 'notes',
+        label: 'ملاحظات',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'code': values['code']?.trim().toUpperCase(),
+      'lockerType': values['lockerType'],
+      if (values['notes']?.trim().isNotEmpty == true)
+        'notes': values['notes']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createMeasurementType',
+    title: 'إضافة نوع قياس',
+    description: 'عرّف قياسًا بدنيًا جديدًا ووحدته ونطاقه المقبول.',
+    submitLabel: 'حفظ نوع القياس',
+    successMessage: 'تمت إضافة نوع القياس.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/measurement-types',
+    icon: Icons.straighten_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز القياس', required: true),
+      WorkflowField(name: 'name', label: 'اسم القياس', required: true),
+      WorkflowField(name: 'unit', label: 'الوحدة', required: true),
+      WorkflowField(
+        name: 'dataKind',
+        label: 'نوع الرقم',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'DECIMAL',
+        choices: [
+          WorkflowChoice('DECIMAL', 'عشري'),
+          WorkflowChoice('INTEGER', 'عدد صحيح'),
+        ],
+      ),
+      WorkflowField(
+        name: 'minimumValue',
+        label: 'أقل قيمة',
+        type: WorkflowFieldType.number,
+      ),
+      WorkflowField(
+        name: 'maximumValue',
+        label: 'أعلى قيمة',
+        type: WorkflowFieldType.number,
+      ),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      'unit': values['unit']?.trim(),
+      'dataKind': values['dataKind'],
+      if (values['minimumValue']?.isNotEmpty == true)
+        'minimumValue': double.tryParse(values['minimumValue']!),
+      if (values['maximumValue']?.isNotEmpty == true)
+        'maximumValue': double.tryParse(values['maximumValue']!),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createPosition',
+    title: 'إضافة مسمى وظيفي',
+    description: 'أنشئ مسمى وظيفيًا وحدد صلاحياته مرة واحدة.',
+    submitLabel: 'حفظ المسمى',
+    successMessage: 'تمت إضافة المسمى الوظيفي.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/positions',
+    icon: Icons.account_tree_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز المسمى', required: true),
+      WorkflowField(name: 'name', label: 'المسمى الوظيفي', required: true),
+      WorkflowField(
+        name: 'permissions',
+        label: 'صلاحيات المسمى',
+        type: WorkflowFieldType.multiReference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/permissions',
+        labelKeys: ['description', 'code'],
+        subtitleKeys: ['code', 'category'],
+      ),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      'permissions': _selectedValues(values['permissions']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createFacility',
+    title: 'إضافة مرفق',
+    description: 'أضف ملعبًا أو قاعة أو مسبحًا إلى الفرع الحالي.',
+    submitLabel: 'حفظ المرفق',
+    successMessage: 'تمت إضافة المرفق.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/facilities',
+    icon: Icons.apartment_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز المرفق', required: true),
+      WorkflowField(name: 'name', label: 'اسم المرفق', required: true),
+      WorkflowField(
+        name: 'type',
+        label: 'نوع المرفق',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'COURT',
+        choices: [
+          WorkflowChoice('COURT', 'ملعب'),
+          WorkflowChoice('ROOM', 'غرفة'),
+          WorkflowChoice('POOL', 'مسبح'),
+          WorkflowChoice('STUDIO', 'استوديو'),
+          WorkflowChoice('TRAINING_AREA', 'منطقة تدريب'),
+        ],
+      ),
+      WorkflowField(
+        name: 'activityId',
+        label: 'النشاط المرتبط',
+        type: WorkflowFieldType.reference,
+        referencePath: '/organizations/{organizationId}/activities',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      'type': values['type'],
+      if (values['activityId']?.isNotEmpty == true)
+        'activityId': values['activityId'],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createBookableResource',
+    title: 'إضافة مورد قابل للحجز',
+    description: 'اربط المرفق بالخدمة وحدد السعة وسياسة الإلغاء.',
+    submitLabel: 'حفظ مورد الحجز',
+    successMessage: 'تمت إضافة مورد الحجز.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/bookable-resources',
+    icon: Icons.event_available_outlined,
+    fields: [
+      WorkflowField(
+        name: 'facilityId',
+        label: 'المرفق',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/facilities',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'serviceId',
+        label: 'الخدمة المرتبطة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/services',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'cancellationPolicyVersionId',
+        label: 'سياسة إلغاء الحجز',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/commercial-policies',
+        labelKeys: ['name'],
+        subtitleKeys: ['policyType', 'versionNumber'],
+      ),
+      WorkflowField(name: 'code', label: 'رمز المورد', required: true),
+      WorkflowField(name: 'name', label: 'اسم المورد', required: true),
+      WorkflowField(
+        name: 'type',
+        label: 'نوع الحجز',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'COURT',
+        choices: [
+          WorkflowChoice('COURT', 'ملعب'),
+          WorkflowChoice('CLASS', 'حصة جماعية'),
+          WorkflowChoice('PERSONAL_TRAINING', 'تدريب شخصي'),
+          WorkflowChoice('APPOINTMENT', 'موعد خدمة فردية'),
+        ],
+      ),
+      WorkflowField(
+        name: 'capacity',
+        label: 'سعة الحجوزات',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '1',
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'facilityId': values['facilityId'],
+      'serviceId': values['serviceId'],
+      'cancellationPolicyVersionId': values['cancellationPolicyVersionId'],
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      'type': values['type'],
+      'capacity': int.tryParse(values['capacity'] ?? '') ?? 1,
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createRole',
+    title: 'إضافة مجموعة صلاحيات',
+    description: 'جهّز مجموعة صلاحيات إضافية يمكن إسنادها لموظف.',
+    submitLabel: 'حفظ مجموعة الصلاحيات',
+    successMessage: 'تمت إضافة مجموعة الصلاحيات.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/roles',
+    icon: Icons.admin_panel_settings_outlined,
+    fields: [
+      WorkflowField(name: 'name', label: 'اسم المجموعة', required: true),
+      WorkflowField(
+        name: 'description',
+        label: 'سبب ومجال الاستخدام',
+        type: WorkflowFieldType.textarea,
+      ),
+      WorkflowField(
+        name: 'permissions',
+        label: 'الصلاحيات الإضافية',
+        type: WorkflowFieldType.multiReference,
+        referencePath: '/organizations/{organizationId}/permissions',
+        labelKeys: ['description', 'code'],
+        subtitleKeys: ['code', 'category'],
+      ),
+    ],
+    body: (values, controller) => {
+      'name': values['name']?.trim(),
+      if (values['description']?.trim().isNotEmpty == true)
+        'description': values['description']?.trim(),
+      'permissions': _selectedValues(values['permissions']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createRoleAssignment',
+    title: 'إسناد صلاحيات إضافية',
+    description: 'اختر الموظف ومجموعة الصلاحيات ونطاق الفروع.',
+    submitLabel: 'حفظ الإسناد',
+    successMessage: 'تم إسناد الصلاحيات.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/role-assignments',
+    icon: Icons.assignment_ind_outlined,
+    fields: [
+      WorkflowField(
+        name: 'userAccountId',
+        label: 'الموظف',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/user-accounts?ownerType=EMPLOYEE&limit=500',
+        labelKeys: ['displayName', 'name'],
+        subtitleKeys: ['employeeNumber', 'email'],
+      ),
+      WorkflowField(
+        name: 'roleId',
+        label: 'مجموعة الصلاحيات',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/roles',
+        labelKeys: ['name'],
+        subtitleKeys: ['description'],
+      ),
+      WorkflowField(
+        name: 'scopeType',
+        label: 'نطاق الصلاحيات',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'SELECTED_BRANCHES',
+        choices: [
+          WorkflowChoice('SELECTED_BRANCHES', 'فروع محددة'),
+          WorkflowChoice('ORGANIZATION', 'جميع الفروع'),
+        ],
+      ),
+      WorkflowField(
+        name: 'branchIds',
+        label: 'الفروع المشمولة',
+        type: WorkflowFieldType.multiReference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/branches',
+        labelKeys: ['name', 'nameAr'],
+        subtitleKeys: ['code'],
+        visibleWhenField: 'scopeType',
+        visibleWhenValues: ['SELECTED_BRANCHES'],
+      ),
+    ],
+    body: (values, controller) => {
+      'userAccountId': values['userAccountId'],
+      'roleId': values['roleId'],
+      'scopeType': values['scopeType'],
+      'branchIds': values['scopeType'] == 'SELECTED_BRANCHES'
+          ? _selectedValues(values['branchIds'])
+          : <String>[],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createNotificationTemplate',
+    title: 'إضافة قالب رسالة',
+    description: 'أنشئ قالبًا موحدًا للرسائل مع المتغيرات المسموحة.',
+    submitLabel: 'حفظ القالب',
+    successMessage: 'تم حفظ قالب الرسالة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/notification-templates',
+    icon: Icons.dynamic_feed_outlined,
+    fields: [
+      WorkflowField(name: 'templateKey', label: 'مفتاح القالب', required: true),
+      WorkflowField(
+        name: 'language',
+        label: 'اللغة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'ar',
+        choices: [
+          WorkflowChoice('ar', 'العربية'),
+          WorkflowChoice('en', 'English'),
+        ],
+      ),
+      WorkflowField(
+        name: 'body',
+        label: 'نص الرسالة',
+        type: WorkflowFieldType.textarea,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'variables',
+        label: 'المتغيرات المسموحة (مفصولة بفواصل)',
+      ),
+    ],
+    body: (values, controller) => {
+      'templateKey': values['templateKey']?.trim(),
+      'language': values['language'],
+      'body': values['body'],
+      'allowedVariables': _selectedValues(values['variables']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createRetailCategory',
+    title: 'إضافة تصنيف متجر',
+    description: 'أضف تصنيفًا لتنظيم منتجات المتجر.',
+    submitLabel: 'حفظ التصنيف',
+    successMessage: 'تمت إضافة تصنيف المتجر.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/retail/categories',
+    icon: Icons.sell_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز التصنيف', required: true),
+      WorkflowField(name: 'name', label: 'اسم التصنيف', required: true),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createRetailProduct',
+    title: 'إضافة منتج',
+    description: 'عرّف منتجًا جديدًا وباركوده ووحدة بيعه.',
+    submitLabel: 'حفظ المنتج',
+    successMessage: 'تمت إضافة المنتج.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/retail/products',
+    icon: Icons.shopping_basket_outlined,
+    fields: [
+      WorkflowField(
+        name: 'categoryId',
+        label: 'التصنيف',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/retail/categories',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(name: 'code', label: 'رمز المنتج', required: true),
+      WorkflowField(name: 'barcode', label: 'الباركود'),
+      WorkflowField(name: 'name', label: 'اسم المنتج', required: true),
+      WorkflowField(
+        name: 'unit',
+        label: 'وحدة البيع',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'UNIT',
+        choices: [
+          WorkflowChoice('UNIT', 'قطعة'),
+          WorkflowChoice('PAIR', 'زوج'),
+          WorkflowChoice('BOTTLE', 'زجاجة'),
+          WorkflowChoice('CAN', 'علبة'),
+          WorkflowChoice('PACK', 'عبوة'),
+          WorkflowChoice('BOX', 'صندوق'),
+          WorkflowChoice('KG', 'كيلوجرام'),
+        ],
+      ),
+      WorkflowField(
+        name: 'description',
+        label: 'الوصف',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) => {
+      'categoryId': values['categoryId'],
+      'code': values['code']?.trim().toUpperCase(),
+      if (values['barcode']?.trim().isNotEmpty == true)
+        'barcode': values['barcode']?.trim(),
+      'name': values['name']?.trim(),
+      'unit': values['unit'],
+      if (values['description']?.trim().isNotEmpty == true)
+        'description': values['description']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createRetailPrice',
+    title: 'إضافة سعر منتج',
+    description: 'حدد سعر البيع والضريبة للفرع الحالي.',
+    submitLabel: 'حفظ السعر',
+    successMessage: 'تم حفظ سعر المنتج.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/retail/prices',
+    icon: Icons.price_change_outlined,
+    fields: [
+      WorkflowField(
+        name: 'productId',
+        label: 'المنتج',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/retail/products',
+        labelKeys: ['name'],
+        subtitleKeys: ['code', 'barcode'],
+      ),
+      WorkflowField(
+        name: 'amount',
+        label: 'سعر البيع (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'taxRate',
+        label: 'نسبة الضريبة %',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '15',
+      ),
+      WorkflowField(
+        name: 'taxInclusive',
+        label: 'السعر شامل الضريبة',
+        type: WorkflowFieldType.checkbox,
+        initialValue: 'true',
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'productId': values['productId'],
+      'amountMinor': _moneyMinor(values['amount']),
+      'taxRateBps': ((double.tryParse(values['taxRate'] ?? '') ?? 0) * 100)
+          .round(),
+      'taxInclusive': _checked(values['taxInclusive']),
+      'validFrom': DateTime.now().toUtc().toIso8601String(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'adjustRetailStock',
+    title: 'تسجيل حركة مخزون',
+    description: 'سجل استلامًا أو مرتجعًا أو تسوية في مخزون الفرع.',
+    submitLabel: 'تسجيل الحركة',
+    successMessage: 'تم تحديث المخزون.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/retail/stock-adjustments',
+    icon: Icons.inventory_outlined,
+    fields: [
+      WorkflowField(
+        name: 'productId',
+        label: 'المنتج',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/retail/products',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'movementType',
+        label: 'نوع الحركة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'RECEIPT',
+        choices: [
+          WorkflowChoice('RECEIPT', 'استلام بضاعة'),
+          WorkflowChoice('RETURN', 'مرتجع عميل سليم'),
+          WorkflowChoice('ADJUSTMENT_IN', 'تسوية بالزيادة'),
+          WorkflowChoice('ADJUSTMENT_OUT', 'تسوية بالنقص'),
+        ],
+      ),
+      WorkflowField(
+        name: 'quantity',
+        label: 'الكمية',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '1',
+      ),
+      WorkflowField(
+        name: 'reorderLevel',
+        label: 'حد إعادة الطلب',
+        type: WorkflowFieldType.number,
+      ),
+      WorkflowField(
+        name: 'notes',
+        label: 'سبب الحركة / رقم المستند',
+        type: WorkflowFieldType.textarea,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'productId': values['productId'],
+      'movementType': values['movementType'],
+      'quantity': double.tryParse(values['quantity'] ?? '') ?? 0,
+      if (values['reorderLevel']?.isNotEmpty == true)
+        'reorderLevel': double.tryParse(values['reorderLevel']!),
+      'notes': values['notes'],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createExpenseCategory',
+    title: 'إضافة تصنيف مصروف',
+    description: 'عرّف تصنيف المصروف وحد المبلغ الذي يتطلب اعتمادًا.',
+    submitLabel: 'حفظ التصنيف',
+    successMessage: 'تمت إضافة تصنيف المصروفات.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/expense-categories',
+    icon: Icons.category_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز التصنيف', required: true),
+      WorkflowField(name: 'name', label: 'اسم التصنيف', required: true),
+      WorkflowField(
+        name: 'approvalThreshold',
+        label: 'يتطلب اعتمادًا من مبلغ (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '0',
+        allowZero: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      'approvalThresholdMinor': _moneyMinor(values['approvalThreshold']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createMealCategory',
+    title: 'إضافة تصنيف وجبات',
+    description: 'أضف تصنيفًا لتنظيم كتالوج مطعم النادي.',
+    submitLabel: 'حفظ التصنيف',
+    successMessage: 'تمت إضافة تصنيف الوجبات.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/restaurant/meal-categories',
+    icon: Icons.ramen_dining_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز التصنيف', required: true),
+      WorkflowField(name: 'name', label: 'اسم التصنيف', required: true),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createPrice',
+    title: 'إضافة سعر',
+    description: 'حدد سعر باقة أو خدمة ونطاق الفرع والضريبة.',
+    submitLabel: 'حفظ السعر',
+    successMessage: 'تم حفظ السعر.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/prices',
+    icon: Icons.price_change_outlined,
+    fields: [
+      WorkflowField(
+        name: 'targetType',
+        label: 'نوع الهدف',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'PACKAGE',
+        choices: [
+          WorkflowChoice('PACKAGE', 'باقة'),
+          WorkflowChoice('SERVICE', 'خدمة'),
+        ],
+      ),
+      WorkflowField(
+        name: 'packageId',
+        label: 'الباقة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/packages',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+        visibleWhenField: 'targetType',
+        visibleWhenValues: ['PACKAGE'],
+      ),
+      WorkflowField(
+        name: 'serviceId',
+        label: 'الخدمة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/services',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+        visibleWhenField: 'targetType',
+        visibleWhenValues: ['SERVICE'],
+      ),
+      WorkflowField(
+        name: 'branchId',
+        label: 'فرع السعر (اختياري)',
+        type: WorkflowFieldType.reference,
+        referencePath: '/organizations/{organizationId}/branches',
+        labelKeys: ['name', 'nameAr'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'amount',
+        label: 'السعر (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'taxRate',
+        label: 'نسبة الضريبة %',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '15',
+      ),
+      WorkflowField(
+        name: 'taxInclusive',
+        label: 'السعر شامل الضريبة',
+        type: WorkflowFieldType.checkbox,
+        initialValue: 'true',
+      ),
+    ],
+    body: (values, controller) => {
+      if (values['branchId']?.isNotEmpty == true)
+        'branchId': values['branchId'],
+      'targetType': values['targetType'],
+      'targetId': values['targetType'] == 'SERVICE'
+          ? values['serviceId']
+          : values['packageId'],
+      'amountMinor': _moneyMinor(values['amount']),
+      'taxRateBps': ((double.tryParse(values['taxRate'] ?? '') ?? 0) * 100)
+          .round(),
+      'taxInclusive': _checked(values['taxInclusive']),
+      'validFrom': DateTime.now().toUtc().toIso8601String(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createPackage',
+    title: 'إضافة باقة',
+    description: 'أنشئ باقة عضوية متكاملة بالمدة والخدمات وسياسات التجميد والإلغاء والتجديد.',
+    submitLabel: 'حفظ الباقة',
+    successMessage: 'تم حفظ الباقة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/packages',
+    icon: Icons.inventory_2_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز الباقة', required: true),
+      WorkflowField(name: 'name', label: 'اسم الباقة', required: true),
+      WorkflowField(
+        name: 'fulfillmentKind',
+        label: 'نوع الباقة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'FACILITY_ACCESS',
+        choices: [
+          WorkflowChoice('FACILITY_ACCESS', 'دخول مرفق'),
+          WorkflowChoice('SESSION', 'جلسات'),
+          WorkflowChoice('MEAL_PLAN', 'خطة وجبات'),
+        ],
+      ),
+      WorkflowField(
+        name: 'durationValue',
+        label: 'مدة الباقة',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '1',
+      ),
+      WorkflowField(
+        name: 'durationUnit',
+        label: 'وحدة المدة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'MONTHS',
+        choices: [
+          WorkflowChoice('DAYS', 'أيام'),
+          WorkflowChoice('WEEKS', 'أسابيع'),
+          WorkflowChoice('MONTHS', 'أشهر'),
+        ],
+      ),
+      WorkflowField(
+        name: 'mealAllowance',
+        label: 'عدد الوجبات في الخطة',
+        type: WorkflowFieldType.number,
+        required: true,
+        visibleWhenField: 'fulfillmentKind',
+        visibleWhenValues: ['MEAL_PLAN'],
+      ),
+      WorkflowField(
+        name: 'accessFrequency',
+        label: 'نظام الحضور',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'UNLIMITED',
+        choices: [
+          WorkflowChoice('UNLIMITED', 'غير محدود'),
+          WorkflowChoice('TOTAL', 'عدد إجمالي طوال الباقة'),
+          WorkflowChoice('WEEK', 'عدد محدد كل أسبوع'),
+          WorkflowChoice('MONTH', 'عدد محدد كل شهر'),
+        ],
+      ),
+      WorkflowField(
+        name: 'visitAllowance',
+        label: 'إجمالي مرات الحضور',
+        type: WorkflowFieldType.number,
+        required: true,
+        visibleWhenField: 'accessFrequency',
+        visibleWhenValues: ['TOTAL'],
+      ),
+      WorkflowField(
+        name: 'visitsPerPeriod',
+        label: 'مرات الحضور في الفترة',
+        type: WorkflowFieldType.number,
+        required: true,
+        visibleWhenField: 'accessFrequency',
+        visibleWhenValues: ['WEEK', 'MONTH'],
+      ),
+      WorkflowField(
+        name: 'branchAccessPolicy',
+        label: 'سياسة الوصول للفروع',
+        type: WorkflowFieldType.select,
+        initialValue: 'SINGLE_BRANCH',
+        choices: [
+          WorkflowChoice('SINGLE_BRANCH', 'فرع البيع فقط'),
+          WorkflowChoice('SELECTED_BRANCHES', 'فروع مختارة'),
+          WorkflowChoice('ALL_ORGANIZATION_BRANCHES', 'كل الفروع'),
+        ],
+      ),
+      WorkflowField(
+        name: 'branchIds',
+        label: 'الفروع المتاحة',
+        type: WorkflowFieldType.multiReference,
+        referencePath: '/organizations/{organizationId}/branches',
+        labelKeys: ['name', 'nameAr'],
+        subtitleKeys: ['code'],
+        visibleWhenField: 'branchAccessPolicy',
+        visibleWhenValues: ['SELECTED_BRANCHES'],
+      ),
+      WorkflowField(
+        name: 'serviceIds',
+        label: 'الخدمات المشمولة',
+        type: WorkflowFieldType.multiReference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/services',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'freezePolicyVersionId',
+        label: 'سياسة التجميد',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/commercial-policies',
+        labelKeys: ['name'],
+        subtitleKeys: ['policyType', 'versionNumber'],
+      ),
+      WorkflowField(
+        name: 'cancellationPolicyVersionId',
+        label: 'سياسة إلغاء الاشتراك',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/commercial-policies',
+        labelKeys: ['name'],
+        subtitleKeys: ['policyType', 'versionNumber'],
+      ),
+      WorkflowField(
+        name: 'renewalPolicyVersionId',
+        label: 'سياسة التجديد',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/commercial-policies',
+        labelKeys: ['name'],
+        subtitleKeys: ['policyType', 'versionNumber'],
+      ),
+      WorkflowField(
+        name: 'description',
+        label: 'الوصف',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) {
+      final multiplier = switch (values['durationUnit']) {
+        'WEEKS' => 7,
+        'MONTHS' => 30,
+        _ => 1,
+      };
+      final mealPlan = values['fulfillmentKind'] == 'MEAL_PLAN';
+      final frequency = values['accessFrequency'];
+      final allowance = mealPlan
+          ? int.tryParse(values['mealAllowance'] ?? '')
+          : frequency == 'TOTAL'
+          ? int.tryParse(values['visitAllowance'] ?? '')
+          : null;
+      final periodic =
+          !mealPlan && (frequency == 'WEEK' || frequency == 'MONTH');
+      return {
+        'code': values['code']?.trim().toUpperCase(),
+        'name': values['name']?.trim(),
+        if (values['description']?.trim().isNotEmpty == true)
+          'description': values['description']?.trim(),
+        'durationDays':
+            (int.tryParse(values['durationValue'] ?? '') ?? 1) * multiplier,
+        'visitAllowance': ?allowance,
+        if (periodic) 'visitLimitPeriod': frequency,
+        if (periodic)
+          'visitsPerPeriod': int.tryParse(values['visitsPerPeriod'] ?? '') ?? 0,
+        'fulfillmentKind': values['fulfillmentKind'],
+        'branchAccessPolicy': values['branchAccessPolicy'],
+        'branchIds': _selectedValues(values['branchIds']),
+        'entitlements': _selectedValues(values['serviceIds'])
+            .map(
+              (serviceId) => {
+                'serviceId': serviceId,
+                if (mealPlan && allowance != null) 'visitAllowance': allowance,
+              },
+            )
+            .toList(growable: false),
+        'freezePolicyVersionId': values['freezePolicyVersionId'],
+        'cancellationPolicyVersionId': values['cancellationPolicyVersionId'],
+        'renewalPolicyVersionId': values['renewalPolicyVersionId'],
+      };
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createPromotion',
+    title: 'إضافة عرض ترويجي',
+    description: 'أنشئ خصمًا بكود أو عرضًا تلقائيًا مستهدفًا.',
+    submitLabel: 'حفظ العرض',
+    successMessage: 'تم حفظ العرض الترويجي.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/promotions',
+    icon: Icons.local_offer_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'كود العرض', required: true),
+      WorkflowField(name: 'name', label: 'اسم العرض', required: true),
+      WorkflowField(
+        name: 'benefitType',
+        label: 'نوع الفائدة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'PERCENTAGE',
+        choices: [
+          WorkflowChoice('PERCENTAGE', 'خصم بالنسبة'),
+          WorkflowChoice('FIXED_DISCOUNT', 'خصم مبلغ ثابت'),
+          WorkflowChoice('FIXED_FINAL_PRICE', 'سعر نهائي ثابت'),
+        ],
+      ),
+      WorkflowField(
+        name: 'benefitValue',
+        label: 'قيمة العرض',
+        type: WorkflowFieldType.number,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'eligibility',
+        label: 'طريقة التطبيق',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'PROMO_CODE',
+        choices: [
+          WorkflowChoice('EVERYONE', 'تلقائي للجميع'),
+          WorkflowChoice('NEW_MEMBER', 'للأعضاء الجدد'),
+          WorkflowChoice('FORMER_MEMBER', 'للأعضاء السابقين'),
+          WorkflowChoice('PROMO_CODE', 'يدوي بكود الخصم'),
+        ],
+      ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'يبدأ العرض',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'validUntil',
+        label: 'ينتهي العرض',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'branchIds',
+        label: 'الفروع المستهدفة',
+        type: WorkflowFieldType.multiReference,
+        referencePath: '/organizations/{organizationId}/branches',
+        labelKeys: ['name', 'nameAr'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'packageIds',
+        label: 'الباقات المشمولة',
+        type: WorkflowFieldType.multiReference,
+        referencePath: '/organizations/{organizationId}/packages',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'serviceIds',
+        label: 'الخدمات المشمولة',
+        type: WorkflowFieldType.multiReference,
+        referencePath: '/organizations/{organizationId}/services',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      'benefitType': values['benefitType'],
+      'benefitValue':
+          ((double.tryParse(values['benefitValue'] ?? '') ?? 0) * 100).round(),
+      'eligibility': values['eligibility'],
+      'validFrom': _asIso(values['validFrom']),
+      'validUntil': _asIso(values['validUntil']),
+      'branchIds': _selectedValues(values['branchIds']),
+      'targets': [
+        ..._selectedValues(values['packageIds'])
+            .map((id) => {'type': 'PACKAGE', 'id': id}),
+        ..._selectedValues(values['serviceIds'])
+            .map((id) => {'type': 'SERVICE', 'id': id}),
+      ],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createCommercialPolicy',
+    title: 'إضافة سياسة تجارية',
+    description: 'عرّف إصدارًا محكمًا لسياسة التجميد أو الإلغاء أو التجديد.',
+    submitLabel: 'حفظ إصدار السياسة',
+    successMessage: 'تم حفظ السياسة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/commercial-policies',
+    icon: Icons.policy_outlined,
+    fields: [
+      WorkflowField(
+        name: 'policyType',
+        label: 'نوع السياسة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'FREEZE',
+        choices: [
+          WorkflowChoice('FREEZE', 'تجميد الاشتراك'),
+          WorkflowChoice('CANCELLATION', 'إلغاء الاشتراك'),
+          WorkflowChoice('RENEWAL', 'تجديد الاشتراك'),
+          WorkflowChoice('BOOKING_CANCELLATION', 'إلغاء الحجز'),
+        ],
+      ),
+      WorkflowField(name: 'policyKey', label: 'رمز السياسة', required: true),
+      WorkflowField(
+        name: 'versionNumber',
+        label: 'رقم الإصدار',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '1',
+      ),
+      WorkflowField(name: 'name', label: 'اسم السياسة', required: true),
+      WorkflowField(
+        name: 'maxDaysPerFreeze',
+        label: 'أقصى أيام للتجميد',
+        type: WorkflowFieldType.number,
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['FREEZE'],
+      ),
+      WorkflowField(
+        name: 'maxFreezesPerTerm',
+        label: 'أقصى مرات تجميد',
+        type: WorkflowFieldType.number,
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['FREEZE'],
+      ),
+      WorkflowField(
+        name: 'minimumActiveDaysBeforeFreeze',
+        label: 'أيام السريان قبل التجميد',
+        type: WorkflowFieldType.number,
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['FREEZE'],
+      ),
+      WorkflowField(
+        name: 'cancellationMode',
+        label: 'موعد الإلغاء',
+        type: WorkflowFieldType.select,
+        initialValue: 'END_OF_TERM',
+        choices: [
+          WorkflowChoice('END_OF_TERM', 'نهاية فترة الاشتراك'),
+          WorkflowChoice('IMMEDIATE_PRORATED', 'فوري مع استرداد نسبي'),
+        ],
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['CANCELLATION'],
+      ),
+      WorkflowField(
+        name: 'noticeDays',
+        label: 'فترة الإشعار بالأيام',
+        type: WorkflowFieldType.number,
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['CANCELLATION'],
+      ),
+      WorkflowField(
+        name: 'fee',
+        label: 'رسوم الإلغاء (ر.س)',
+        type: WorkflowFieldType.number,
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['CANCELLATION'],
+      ),
+      WorkflowField(
+        name: 'graceDays',
+        label: 'مهلة التجديد بالأيام',
+        type: WorkflowFieldType.number,
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['RENEWAL'],
+      ),
+      WorkflowField(
+        name: 'cutoffHours',
+        label: 'آخر موعد للإلغاء (ساعات)',
+        type: WorkflowFieldType.number,
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['BOOKING_CANCELLATION'],
+      ),
+      WorkflowField(
+        name: 'refundPercentage',
+        label: 'نسبة الاسترداد %',
+        type: WorkflowFieldType.number,
+        visibleWhenField: 'policyType',
+        visibleWhenValues: ['BOOKING_CANCELLATION'],
+      ),
+    ],
+    body: (values, controller) {
+      final type = values['policyType'];
+      final configuration = switch (type) {
+        'FREEZE' => {
+          'maxDaysPerFreeze':
+              int.tryParse(values['maxDaysPerFreeze'] ?? '') ?? 0,
+          'maxFreezesPerTerm':
+              int.tryParse(values['maxFreezesPerTerm'] ?? '') ?? 0,
+          'minimumActiveDaysBeforeFreeze':
+              int.tryParse(values['minimumActiveDaysBeforeFreeze'] ?? '') ?? 0,
+        },
+        'CANCELLATION' => {
+          'noticeDays': int.tryParse(values['noticeDays'] ?? '') ?? 0,
+          'refundable': values['cancellationMode'] == 'IMMEDIATE_PRORATED',
+          'feeMinor': int.tryParse(_moneyMinor(values['fee'])) ?? 0,
+          'cancellationMode': values['cancellationMode'],
+        },
+        'RENEWAL' => {
+          'graceDays': int.tryParse(values['graceDays'] ?? '') ?? 0,
+          'allowEarlyRenewalDays': 0,
+        },
+        _ => {
+          'cutoffHours': int.tryParse(values['cutoffHours'] ?? '') ?? 0,
+          'refundPercentageBps':
+              ((double.tryParse(values['refundPercentage'] ?? '') ?? 0) * 100)
+                  .round(),
+        },
+      };
+      return {
+        'policyKey': values['policyKey']?.trim().toUpperCase(),
+        'versionNumber': int.tryParse(values['versionNumber'] ?? '') ?? 1,
+        'policyType': type,
+        'name': values['name']?.trim(),
+        'configuration': configuration,
+      };
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createRestaurantMeal',
+    title: 'إضافة وجبة',
+    description: 'أضف الوجبة مع تصنيفها وحجمها وقيمها الغذائية.',
+    submitLabel: 'إضافة الوجبة',
+    successMessage: 'تمت إضافة الوجبة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/restaurant/meals',
+    icon: Icons.lunch_dining_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز الوجبة', required: true),
+      WorkflowField(name: 'name', label: 'اسم الوجبة', required: true),
+      WorkflowField(
+        name: 'categoryId',
+        label: 'التصنيف',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath:
+            '/organizations/{organizationId}/restaurant/meal-categories',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'kind',
+        label: 'النوع',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'MEAL',
+        choices: [
+          WorkflowChoice('MEAL', 'وجبة'),
+          WorkflowChoice('PRODUCT', 'منتج'),
+          WorkflowChoice('DRINK', 'مشروب'),
+        ],
+      ),
+      WorkflowField(
+        name: 'portionClass',
+        label: 'حجم الحصة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'UNRESTRICTED',
+        choices: [
+          WorkflowChoice('UNRESTRICTED', 'حصة قياسية'),
+          WorkflowChoice('STANDARD_150G', '150 جرام'),
+          WorkflowChoice('LARGE_200G', '200 جرام'),
+        ],
+      ),
+      WorkflowField(
+        name: 'caloriesKcal',
+        label: 'السعرات الحرارية',
+        type: WorkflowFieldType.number,
+        initialValue: '0',
+        allowZero: true,
+      ),
+      WorkflowField(
+        name: 'proteinGrams',
+        label: 'البروتين (جم)',
+        type: WorkflowFieldType.number,
+        initialValue: '0',
+        allowZero: true,
+      ),
+      WorkflowField(
+        name: 'carbohydratesGrams',
+        label: 'الكربوهيدرات (جم)',
+        type: WorkflowFieldType.number,
+        initialValue: '0',
+        allowZero: true,
+      ),
+      WorkflowField(
+        name: 'fatGrams',
+        label: 'الدهون (جم)',
+        type: WorkflowFieldType.number,
+        initialValue: '0',
+        allowZero: true,
+      ),
+      WorkflowField(
+        name: 'fiberGrams',
+        label: 'الألياف (جم)',
+        type: WorkflowFieldType.number,
+        initialValue: '0',
+        allowZero: true,
+      ),
+      WorkflowField(
+        name: 'sugarGrams',
+        label: 'السكر (جم)',
+        type: WorkflowFieldType.number,
+        initialValue: '0',
+        allowZero: true,
+      ),
+      WorkflowField(
+        name: 'sodiumMilligrams',
+        label: 'الصوديوم (ملجم)',
+        type: WorkflowFieldType.number,
+        initialValue: '0',
+        allowZero: true,
+      ),
+      WorkflowField(name: 'allergens', label: 'الحساسيات (مفصولة بفواصل)'),
+      WorkflowField(
+        name: 'description',
+        label: 'الوصف',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'categoryId': values['categoryId'],
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      if (values['description']?.trim().isNotEmpty == true)
+        'description': values['description']?.trim(),
+      'kind': values['kind'],
+      'portionClass': values['portionClass'],
+      'nutrition': {
+        for (final key in [
+          'caloriesKcal',
+          'proteinGrams',
+          'carbohydratesGrams',
+          'fatGrams',
+          'fiberGrams',
+          'sugarGrams',
+          'sodiumMilligrams',
+        ])
+          key: double.tryParse(values[key] ?? '') ?? 0,
+      },
+      'allergens': _selectedValues(values['allergens']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createRestaurantMealPrice',
+    title: 'تسعير وجبة',
+    description: 'حدد سعر الوجبة وضريبتها في الفرع الحالي.',
+    submitLabel: 'حفظ سعر الوجبة',
+    successMessage: 'تم حفظ سعر الوجبة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/restaurant/meal-prices',
+    icon: Icons.price_check_outlined,
+    fields: [
+      WorkflowField(
+        name: 'mealId',
+        label: 'الوجبة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/restaurant/meals',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'amount',
+        label: 'السعر (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'taxRate',
+        label: 'نسبة الضريبة %',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '15',
+      ),
+      WorkflowField(
+        name: 'taxInclusive',
+        label: 'السعر شامل الضريبة',
+        type: WorkflowFieldType.checkbox,
+        initialValue: 'true',
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'mealId': values['mealId'],
+      'amountMinor': _moneyMinor(values['amount']),
+      'taxRateBps': ((double.tryParse(values['taxRate'] ?? '') ?? 0) * 100)
+          .round(),
+      'taxInclusive': _checked(values['taxInclusive']),
+      'validFrom': DateTime.now().toUtc().toIso8601String(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'checkoutSelfService',
+    title: 'طلب خدمة',
+    description: 'اختر الخدمة المتاحة في الفرع؛ سينشئ النظام الطلب والفاتورة.',
+    submitLabel: 'طلب الخدمة',
+    successMessage: 'تم إنشاء طلب الخدمة والفاتورة.',
+    method: 'POST',
+    path: '/self/organizations/{organizationId}/members/{memberId}/orders',
+    icon: Icons.shopping_bag_outlined,
+    fields: [
+      WorkflowField(
+        name: 'serviceId',
+        label: 'الخدمة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/self/organizations/{organizationId}/services',
+        labelKeys: ['name'],
+        subtitleKeys: ['categoryName', 'amountMinor'],
+      ),
+    ],
+    body: (values, controller) => {
+      'sellingBranchId': controller.branchId,
+      'lines': [
+        {'type': 'SERVICE', 'targetId': values['serviceId'], 'quantity': 1},
+      ],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'checkoutSelfBooking',
+    title: 'حجز موعد',
+    description: 'اختر المورد والموعد المتاح لإنشاء الحجز والفاتورة.',
+    submitLabel: 'تأكيد الحجز',
+    successMessage: 'تم إنشاء الحجز والفاتورة.',
+    method: 'POST',
+    path: '/self/organizations/{organizationId}/members/{memberId}/orders',
+    icon: Icons.event_available_outlined,
+    fields: [
+      WorkflowField(
+        name: 'resourceId',
+        label: 'المورد القابل للحجز',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath:
+            '/self/organizations/{organizationId}/bookable-resources',
+        labelKeys: ['name', 'resourceName'],
+        subtitleKeys: ['facilityName', 'resourceType'],
+        copyValues: {'serviceId': 'serviceId', 'resourceType': 'resourceType'},
+      ),
+      WorkflowField(
+        name: 'serviceId',
+        label: 'الخدمة',
+        type: WorkflowFieldType.hidden,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'resourceType',
+        label: 'نوع المورد',
+        type: WorkflowFieldType.hidden,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'sessionSlotId',
+        label: 'الموعد المتاح',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/self/organizations/{organizationId}/bookable-resources/{resourceId}/session-slots',
+        labelKeys: ['startsAt', 'name'],
+        subtitleKeys: ['endsAt', 'remainingCapacity'],
+        visibleWhenField: 'resourceType',
+        visibleWhenValues: ['CLASS', 'PERSONAL_TRAINING', 'APPOINTMENT'],
+      ),
+      WorkflowField(
+        name: 'startsAt',
+        label: 'بداية حجز الملعب',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+        visibleWhenField: 'resourceType',
+        visibleWhenValues: ['COURT'],
+      ),
+      WorkflowField(
+        name: 'endsAt',
+        label: 'نهاية حجز الملعب',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+        visibleWhenField: 'resourceType',
+        visibleWhenValues: ['COURT'],
+      ),
+      WorkflowField(
+        name: 'participantCount',
+        label: 'عدد المشاركين',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '1',
+      ),
+    ],
+    body: (values, controller) {
+      final type = values['resourceType'];
+      return {
+        'sellingBranchId': controller.branchId,
+        'lines': [
+          {
+            'type': 'BOOKING',
+            'targetId': values['serviceId'],
+            'quantity': 1,
+            'booking': {
+              'resourceId': values['resourceId'],
+              'type': type,
+              if (type == 'COURT') ...{
+                'startsAt': _asIso(values['startsAt']),
+                'endsAt': _asIso(values['endsAt']),
+              } else
+                'sessionSlotId': values['sessionSlotId'],
+              'seats': 1,
+              'participantCount':
+                  int.tryParse(values['participantCount'] ?? '') ?? 1,
+            },
+          },
+        ],
+      };
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'openCashierShift',
+    title: 'فتح وردية صندوق',
+    description: 'اختر نقطة التحصيل وسجل الرصيد الافتتاحي قبل التحصيل النقدي.',
+    submitLabel: 'فتح الوردية',
+    successMessage: 'تم فتح وردية الصندوق.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/cashier-shifts',
+    icon: Icons.lock_open_outlined,
+    fields: [
+      WorkflowField(
+        name: 'cashPointId',
+        label: 'نقطة التحصيل',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/cash-points',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'openingBalance',
+        label: 'الرصيد الافتتاحي (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '0',
+        allowZero: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'cashPointId': values['cashPointId'],
+      'openingBalanceMinor': _moneyMinor(values['openingBalance']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'closeCashierShift',
+    title: 'إغلاق وردية الصندوق',
+    description: 'اختر الوردية المفتوحة وأدخل الرصيد الفعلي. يسجل النظام فرق الصندوق للمراجعة.',
+    submitLabel: 'إغلاق الوردية',
+    successMessage: 'تم إغلاق وردية الصندوق وتسجيل الرصيد الفعلي.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/cashier-shifts/{cashierShiftId}/closures',
+    icon: Icons.lock_clock_outlined,
+    fields: [
+      WorkflowField(
+        name: 'cashierShiftId',
+        label: 'وردية الصندوق',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/cashier-shifts',
+        labelKeys: ['cashPointName', 'cashierName'],
+        subtitleKeys: ['openedAt', 'status'],
+      ),
+      WorkflowField(
+        name: 'actualClosingBalance',
+        label: 'الرصيد الفعلي عند الإغلاق (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+        allowZero: true,
+      ),
+      WorkflowField(
+        name: 'reason',
+        label: 'ملاحظة الإغلاق أو سبب الفرق',
+        type: WorkflowFieldType.textarea,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'actualClosingMinor': _moneyMinor(values['actualClosingBalance']),
+      'reason': values['reason']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'registerAccessDevice',
+    title: 'تسجيل لوحة بوابة',
+    description: 'أضف لوحة ZKTeco أو بوابة متوافقة واربطها بالفرع. سيظهر مفتاح الاتصال مرة واحدة بعد الحفظ.',
+    submitLabel: 'تسجيل اللوحة',
+    successMessage: 'تم تسجيل لوحة البوابة وإصدار مفتاح الاتصال.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/access-devices',
+    icon: Icons.add_to_home_screen_outlined,
+    fields: [
+      WorkflowField(name: 'name', label: 'اسم البوابة', required: true),
+      WorkflowField(
+        name: 'serialNumber',
+        label: 'الرقم التسلسلي',
+        required: true,
+      ),
+      WorkflowField(name: 'model', label: 'الموديل'),
+      WorkflowField(name: 'firmwareVersion', label: 'إصدار النظام'),
+      WorkflowField(name: 'ipAddress', label: 'عنوان IP'),
+      WorkflowField(
+        name: 'doorCount',
+        label: 'عدد الأبواب',
+        type: WorkflowFieldType.number,
+        initialValue: '1',
+      ),
+      WorkflowField(
+        name: 'readerCount',
+        label: 'عدد القارئات',
+        type: WorkflowFieldType.number,
+        initialValue: '1',
+      ),
+      WorkflowField(
+        name: 'mode',
+        label: 'وضع التشغيل الأولي',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'OBSERVE',
+        choices: [
+          WorkflowChoice('OBSERVE', 'مراقبة فقط'),
+          WorkflowChoice('ENFORCE', 'تنفيذ قرارات الدخول'),
+        ],
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'name': values['name']?.trim(),
+      'serialNumber': values['serialNumber']?.trim(),
+      if (values['model']?.trim().isNotEmpty == true)
+        'model': values['model']?.trim(),
+      if (values['firmwareVersion']?.trim().isNotEmpty == true)
+        'firmwareVersion': values['firmwareVersion']?.trim(),
+      if (values['ipAddress']?.trim().isNotEmpty == true)
+        'ipAddress': values['ipAddress']?.trim(),
+      if (values['doorCount']?.isNotEmpty == true)
+        'doorCount': int.tryParse(values['doorCount']!),
+      if (values['readerCount']?.isNotEmpty == true)
+        'readerCount': int.tryParse(values['readerCount']!),
+      'mode': values['mode'],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'issueAccessBarcode',
+    title: 'إصدار بطاقة دخول',
+    description: 'أصدر باركود دخول فريدًا لعضو أو موظف.',
+    submitLabel: 'إصدار البطاقة',
+    successMessage: 'تم إصدار بطاقة الدخول.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/access-credentials/barcodes',
+    icon: Icons.qr_code_2_rounded,
+    fields: [
+      WorkflowField(
+        name: 'subjectType',
+        label: 'نوع صاحب البطاقة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'MEMBER',
+        choices: [
+          WorkflowChoice('MEMBER', 'عضو'),
+          WorkflowChoice('EMPLOYEE', 'موظف'),
+        ],
+      ),
+      WorkflowField(
+        name: 'memberId',
+        label: 'العضو',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber'],
+        visibleWhenField: 'subjectType',
+        visibleWhenValues: ['MEMBER'],
+      ),
+      WorkflowField(
+        name: 'employeeId',
+        label: 'الموظف',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/employees',
+        labelKeys: ['name', 'displayName'],
+        subtitleKeys: ['employeeNumber'],
+        visibleWhenField: 'subjectType',
+        visibleWhenValues: ['EMPLOYEE'],
+      ),
+    ],
+    body: (values, controller) => {
+      'subjectType': values['subjectType'],
+      'subjectId': values['subjectType'] == 'MEMBER'
+          ? values['memberId']
+          : values['employeeId'],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'assignFingerprintPin',
+    title: 'ربط PIN البصمة',
+    description: 'اربط رقم جهاز البصمة بعضو أو موظف دون نقل قالب البصمة.',
+    submitLabel: 'ربط PIN',
+    successMessage: 'تم ربط PIN بنجاح.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/access-credentials/fingerprint-pins',
+    icon: Icons.fingerprint_rounded,
+    fields: [
+      WorkflowField(
+        name: 'subjectType',
+        label: 'النوع',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'MEMBER',
+        choices: [
+          WorkflowChoice('MEMBER', 'عضو'),
+          WorkflowChoice('EMPLOYEE', 'موظف'),
+        ],
+      ),
+      WorkflowField(
+        name: 'memberId',
+        label: 'العضو',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber'],
+        visibleWhenField: 'subjectType',
+        visibleWhenValues: ['MEMBER'],
+      ),
+      WorkflowField(
+        name: 'employeeId',
+        label: 'الموظف',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/employees',
+        labelKeys: ['name', 'displayName'],
+        subtitleKeys: ['employeeNumber'],
+        visibleWhenField: 'subjectType',
+        visibleWhenValues: ['EMPLOYEE'],
+      ),
+      WorkflowField(
+        name: 'pin',
+        label: 'PIN جهاز البصمة',
+        type: WorkflowFieldType.number,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'subjectType': values['subjectType'],
+      'subjectId': values['subjectType'] == 'MEMBER'
+          ? values['memberId']
+          : values['employeeId'],
+      'pin': values['pin']?.replaceAll(RegExp(r'\D'), ''),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createCoachingSpecialty',
+    title: 'إضافة تخصص تدريب',
+    description: 'عرّف تخصصًا جديدًا لملفات المدربين.',
+    submitLabel: 'حفظ التخصص',
+    successMessage: 'تمت إضافة تخصص التدريب.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/coaching-specialties',
+    icon: Icons.workspace_premium_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز التخصص', required: true),
+      WorkflowField(name: 'name', label: 'اسم التخصص', required: true),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createTrainerProfile',
+    title: 'إنشاء ملف مدرب',
+    description: 'اربط الموظف بملف مدرب وحدد اسمه الظاهر وتخصصاته.',
+    submitLabel: 'إنشاء ملف المدرب',
+    successMessage: 'تم إنشاء ملف المدرب.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/trainers',
+    icon: Icons.fitness_center_outlined,
+    fields: [
+      WorkflowField(
+        name: 'employeeId',
+        label: 'الموظف',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/employees',
+        labelKeys: ['name', 'displayName'],
+        subtitleKeys: ['employeeNumber'],
+      ),
+      WorkflowField(
+        name: 'displayName',
+        label: 'الاسم الظاهر للأعضاء',
+        required: true,
+      ),
+      WorkflowField(
+        name: 'specialtyIds',
+        label: 'التخصصات',
+        type: WorkflowFieldType.multiReference,
+        referencePath: '/organizations/{organizationId}/coaching-specialties',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'publicBio',
+        label: 'نبذة مختصرة',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) => {
+      'employeeId': values['employeeId'],
+      'displayName': values['displayName']?.trim(),
+      'specialtyIds': _selectedValues(values['specialtyIds']),
+      if (values['publicBio']?.trim().isNotEmpty == true)
+        'publicBio': values['publicBio']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createOtherIncomeCategory',
+    title: 'إضافة تصنيف إيراد',
+    description: 'أضف بندًا لتصنيف الإيرادات غير المرتبطة بالمبيعات.',
+    submitLabel: 'حفظ التصنيف',
+    successMessage: 'تمت إضافة تصنيف الإيراد.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/other-income-categories',
+    icon: Icons.account_tree_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز التصنيف', required: true),
+      WorkflowField(name: 'name', label: 'اسم التصنيف', required: true),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createCommunicationTemplate',
+    title: 'حفظ رسالة متكررة',
+    description: 'أنشئ رسالة محفوظة لإعادة استخدامها في الحملات.',
+    submitLabel: 'حفظ الرسالة',
+    successMessage: 'تم حفظ الرسالة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/communication-templates',
+    icon: Icons.mark_email_unread_outlined,
+    fields: [
+      WorkflowField(name: 'name', label: 'اسم الرسالة', required: true),
+      WorkflowField(
+        name: 'purpose',
+        label: 'الغرض',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'ANNOUNCEMENT',
+        choices: [
+          WorkflowChoice('MARKETING', 'ترويج'),
+          WorkflowChoice('RENEWAL', 'تجديد'),
+          WorkflowChoice('REMINDER', 'تذكير'),
+          WorkflowChoice('ANNOUNCEMENT', 'إعلان'),
+          WorkflowChoice('FOLLOW_UP', 'متابعة'),
+          WorkflowChoice('OTHER', 'أخرى'),
+        ],
+      ),
+      WorkflowField(name: 'title', label: 'عنوان الإشعار', required: true),
+      WorkflowField(
+        name: 'body',
+        label: 'نص الرسالة',
+        type: WorkflowFieldType.textarea,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'name': values['name']?.trim(),
+      'purpose': values['purpose'],
+      'title': values['title']?.trim(),
+      'body': values['body']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createCommunicationCampaign',
+    title: 'إرسال رسالة للأعضاء',
+    description: 'أرسل إشعارًا داخل النظام لعضو محدد أو لكل الأعضاء النشطين.',
+    submitLabel: 'إرسال الرسالة',
+    successMessage: 'تم إنشاء حملة التواصل.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/communication-campaigns',
+    icon: Icons.campaign_outlined,
+    fields: [
+      WorkflowField(name: 'name', label: 'اسم الحملة داخليًا', required: true),
+      WorkflowField(
+        name: 'purpose',
+        label: 'الغرض',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'ANNOUNCEMENT',
+        choices: [
+          WorkflowChoice('MARKETING', 'ترويج'),
+          WorkflowChoice('RENEWAL', 'تجديد'),
+          WorkflowChoice('REMINDER', 'تذكير'),
+          WorkflowChoice('ANNOUNCEMENT', 'إعلان'),
+          WorkflowChoice('FOLLOW_UP', 'متابعة'),
+          WorkflowChoice('OTHER', 'أخرى'),
+        ],
+      ),
+      WorkflowField(
+        name: 'audienceType',
+        label: 'الجمهور',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'ALL_MEMBERS',
+        choices: [
+          WorkflowChoice('ALL_MEMBERS', 'كل الأعضاء النشطين'),
+          WorkflowChoice('SINGLE_MEMBER', 'عضو محدد'),
+        ],
+      ),
+      WorkflowField(
+        name: 'memberId',
+        label: 'العضو',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber'],
+        visibleWhenField: 'audienceType',
+        visibleWhenValues: ['SINGLE_MEMBER'],
+      ),
+      WorkflowField(name: 'title', label: 'عنوان الإشعار', required: true),
+      WorkflowField(
+        name: 'body',
+        label: 'نص الرسالة',
+        type: WorkflowFieldType.textarea,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'scheduledAt',
+        label: 'موعد الإرسال (اتركه للإرسال الآن)',
+        type: WorkflowFieldType.dateTime,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'name': values['name']?.trim(),
+      'purpose': values['purpose'],
+      'title': values['title']?.trim(),
+      'body': values['body']?.trim(),
+      'audienceType': values['audienceType'],
+      'audienceFilter': values['audienceType'] == 'SINGLE_MEMBER'
+          ? {'memberId': values['memberId']}
+          : {'memberStatus': 'ACTIVE'},
+      'channels': ['IN_APP'],
+      if (values['scheduledAt']?.isNotEmpty == true)
+        'scheduledAt': _asIso(values['scheduledAt']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'recordEmployeeAttendance',
+    title: 'تسجيل حضور موظف',
+    description: 'سجل الحضور أو الانصراف اليدوي مع الوقت الفعلي للعملية.',
+    submitLabel: 'تسجيل الحركة',
+    successMessage: 'تم تسجيل حركة دوام الموظف.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/employee-attendance',
+    icon: Icons.punch_clock_outlined,
+    fields: [
+      WorkflowField(
+        name: 'employeeId',
+        label: 'الموظف',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/employees',
+        labelKeys: ['name', 'displayName'],
+        subtitleKeys: ['employeeNumber'],
+      ),
+      WorkflowField(
+        name: 'eventType',
+        label: 'الحركة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'CLOCK_IN',
+        choices: [
+          WorkflowChoice('CLOCK_IN', 'حضور'),
+          WorkflowChoice('CLOCK_OUT', 'انصراف'),
+        ],
+      ),
+      WorkflowField(
+        name: 'occurredAt',
+        label: 'وقت الحركة',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'employeeId': values['employeeId'],
+      'eventType': values['eventType'],
+      'accessMethod': 'MANUAL',
+      'occurredAt': _asIso(values['occurredAt']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createWhatsAppCampaign',
+    title: 'إنشاء حملة واتساب',
+    description: 'أنشئ مسودة رسالة واتساب معتمدة للأعضاء النشطين، ثم راجعها قبل وضعها في طابور الإرسال.',
+    submitLabel: 'حفظ المسودة',
+    successMessage: 'تم حفظ حملة واتساب كمسودة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/whatsapp-campaigns',
+    icon: Icons.chat_outlined,
+    fields: [
+      WorkflowField(name: 'name', label: 'اسم الحملة', required: true),
+      WorkflowField(
+        name: 'providerTemplateName',
+        label: 'اسم قالب مزود واتساب',
+        required: true,
+      ),
+      WorkflowField(
+        name: 'languageCode',
+        label: 'كود اللغة',
+        required: true,
+        initialValue: 'ar',
+      ),
+      WorkflowField(
+        name: 'messageTemplate',
+        label: 'نص الرسالة (يدعم {{memberName}})',
+        type: WorkflowFieldType.textarea,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'name': values['name']?.trim(),
+      'providerTemplateName': values['providerTemplateName']?.trim(),
+      'languageCode': values['languageCode']?.trim(),
+      'messageTemplate': values['messageTemplate']?.trim(),
+      'audienceFilter': {
+        'memberStatus': 'ACTIVE',
+        'verifiedPrimaryPhoneOnly': true,
+      },
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createCommissionPlan',
+    title: 'إضافة خطة عمولة',
+    description: 'حدد طريقة احتساب عمولة المدرب وتاريخ سريانها.',
+    submitLabel: 'حفظ خطة العمولة',
+    successMessage: 'تمت إضافة خطة عمولة المدرب.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/trainer-commission-plans',
+    icon: Icons.rule_outlined,
+    fields: [
+      WorkflowField(
+        name: 'trainerProfileId',
+        label: 'المدرب',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/trainers',
+        labelKeys: ['displayName', 'name'],
+        subtitleKeys: ['employeeNumber'],
+      ),
+      WorkflowField(
+        name: 'commissionType',
+        label: 'نوع العمولة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'PERCENTAGE',
+        choices: [
+          WorkflowChoice('PERCENTAGE', 'نسبة مئوية'),
+          WorkflowChoice('FIXED_PER_SESSION', 'مبلغ ثابت للجلسة'),
+        ],
+      ),
+      WorkflowField(
+        name: 'ratePercent',
+        label: 'النسبة المئوية',
+        type: WorkflowFieldType.number,
+        required: true,
+        visibleWhenField: 'commissionType',
+        visibleWhenValues: ['PERCENTAGE'],
+      ),
+      WorkflowField(
+        name: 'fixedAmount',
+        label: 'المبلغ الثابت (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+        visibleWhenField: 'commissionType',
+        visibleWhenValues: ['FIXED_PER_SESSION'],
+      ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'بداية السريان',
+        type: WorkflowFieldType.date,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'validUntil',
+        label: 'نهاية السريان (اختياري)',
+        type: WorkflowFieldType.date,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'trainerProfileId': values['trainerProfileId'],
+      'commissionType': values['commissionType'],
+      if (values['commissionType'] == 'PERCENTAGE')
+        'rateBps': ((double.tryParse(values['ratePercent'] ?? '') ?? 0) * 100)
+            .round(),
+      if (values['commissionType'] == 'FIXED_PER_SESSION')
+        'fixedAmountMinor': _moneyMinor(values['fixedAmount']),
+      'validFrom': values['validFrom'],
+      if (values['validUntil']?.isNotEmpty == true)
+        'validUntil': values['validUntil'],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'accrueTrainerCommission',
+    title: 'تسجيل عمولة مدرب',
+    description: 'سجل مصدر وقيمة العملية ليحسب النظام العمولة المستحقة.',
+    submitLabel: 'احتساب العمولة',
+    successMessage: 'تم احتساب عمولة المدرب.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/trainer-commissions',
+    icon: Icons.percent_outlined,
+    fields: [
+      WorkflowField(
+        name: 'trainerProfileId',
+        label: 'المدرب',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/trainers',
+        labelKeys: ['displayName', 'name'],
+        subtitleKeys: ['employeeNumber'],
+      ),
+      WorkflowField(
+        name: 'sourceType',
+        label: 'مصدر العمولة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'MANUAL_ADJUSTMENT',
+        choices: [
+          WorkflowChoice('PERSONAL_TRAINING', 'تدريب شخصي'),
+          WorkflowChoice('SUBSCRIPTION_SALE', 'بيع اشتراك'),
+          WorkflowChoice('MANUAL_ADJUSTMENT', 'تسوية يدوية'),
+        ],
+      ),
+      WorkflowField(
+        name: 'sourceId',
+        label: 'معرّف العملية المصدرية',
+        required: true,
+      ),
+      WorkflowField(
+        name: 'basisAmount',
+        label: 'قيمة أساس العمولة (ر.س)',
+        type: WorkflowFieldType.number,
+        required: true,
+        allowZero: true,
+      ),
+      WorkflowField(
+        name: 'occurredAt',
+        label: 'تاريخ العملية',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'trainerProfileId': values['trainerProfileId'],
+      'sourceType': values['sourceType'],
+      'sourceId': values['sourceId']?.trim(),
+      'basisAmountMinor': _moneyMinor(values['basisAmount']),
+      'occurredAt': _asIso(values['occurredAt']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createTrainingPlanTemplate',
+    title: 'إنشاء قالب خطة تدريب',
+    description: 'أنشئ قالبًا سريعًا يبدأ بتمرين واحد؛ يمكن توسيعه لاحقًا من إدارة الخطط.',
+    submitLabel: 'حفظ القالب',
+    successMessage: 'تم إنشاء قالب خطة التدريب.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/training-plan-templates',
+    icon: Icons.content_paste_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز القالب', required: true),
+      WorkflowField(name: 'name', label: 'اسم الخطة', required: true),
+      WorkflowField(name: 'goal', label: 'الهدف'),
+      WorkflowField(
+        name: 'exerciseName',
+        label: 'اسم التمرين الأول',
+        required: true,
+      ),
+      WorkflowField(
+        name: 'sets',
+        label: 'عدد المجموعات',
+        type: WorkflowFieldType.number,
+      ),
+      WorkflowField(name: 'repetitions', label: 'التكرارات'),
+      WorkflowField(
+        name: 'instructions',
+        label: 'تعليمات التمرين',
+        type: WorkflowFieldType.textarea,
+      ),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'name': values['name']?.trim(),
+      if (values['goal']?.trim().isNotEmpty == true)
+        'goal': values['goal']?.trim(),
+      'items': [
+        {
+          'dayNumber': 1,
+          'sequenceNumber': 1,
+          'exerciseName': values['exerciseName']?.trim(),
+          if (values['sets']?.isNotEmpty == true)
+            'sets': int.tryParse(values['sets']!),
+          if (values['repetitions']?.trim().isNotEmpty == true)
+            'repetitions': values['repetitions']?.trim(),
+          if (values['instructions']?.trim().isNotEmpty == true)
+            'instructions': values['instructions']?.trim(),
+        },
+      ],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createMemberTrainingPlan',
+    title: 'إسناد خطة تدريب لعضو',
+    description: 'اختر العضو والقالب والمدرب وحدد مدة الخطة.',
+    submitLabel: 'إسناد الخطة',
+    successMessage: 'تم إسناد الخطة التدريبية للعضو.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/member-training-plans',
+    icon: Icons.fitness_center_outlined,
+    fields: [
+      WorkflowField(
+        name: 'memberId',
+        label: 'العضو',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber'],
+      ),
+      WorkflowField(
+        name: 'sourceTemplateId',
+        label: 'قالب الخطة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath:
+            '/organizations/{organizationId}/training-plan-templates',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'trainerProfileId',
+        label: 'المدرب (اختياري)',
+        type: WorkflowFieldType.reference,
+        referencePath: '/organizations/{organizationId}/trainers',
+        labelKeys: ['displayName', 'name'],
+        subtitleKeys: ['employeeNumber'],
+      ),
+      WorkflowField(name: 'name', label: 'اسم الخطة', required: true),
+      WorkflowField(name: 'goal', label: 'الهدف'),
+      WorkflowField(
+        name: 'startsOn',
+        label: 'تاريخ البداية',
+        type: WorkflowFieldType.date,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'endsOn',
+        label: 'تاريخ النهاية (اختياري)',
+        type: WorkflowFieldType.date,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'memberId': values['memberId'],
+      'sourceTemplateId': values['sourceTemplateId'],
+      if (values['trainerProfileId']?.isNotEmpty == true)
+        'trainerProfileId': values['trainerProfileId'],
+      'name': values['name']?.trim(),
+      if (values['goal']?.trim().isNotEmpty == true)
+        'goal': values['goal']?.trim(),
+      'startsOn': values['startsOn'],
+      if (values['endsOn']?.isNotEmpty == true) 'endsOn': values['endsOn'],
+      'items': <Map<String, dynamic>>[],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createCrmLeadSource',
+    title: 'إضافة مصدر عميل',
+    description: 'عرّف قناة اكتساب جديدة لتقارير العملاء المحتملين.',
+    submitLabel: 'حفظ المصدر',
+    successMessage: 'تمت إضافة مصدر العميل.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/crm/lead-sources',
+    icon: Icons.source_outlined,
+    fields: [
+      WorkflowField(name: 'code', label: 'رمز المصدر', required: true),
+      WorkflowField(name: 'nameAr', label: 'الاسم بالعربية', required: true),
+      WorkflowField(name: 'nameEn', label: 'الاسم بالإنجليزية'),
+    ],
+    body: (values, controller) => {
+      'code': values['code']?.trim().toUpperCase(),
+      'nameAr': values['nameAr']?.trim(),
+      if (values['nameEn']?.trim().isNotEmpty == true)
+        'nameEn': values['nameEn']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createDailyMenu',
+    title: 'إنشاء قائمة اليوم',
+    description: 'اختر الوجبات التي ستظهر للأعضاء في الفرع اليوم، ثم انشر القائمة من إجراءات السجل.',
+    submitLabel: 'إنشاء قائمة اليوم',
+    successMessage: 'تم إنشاء مسودة قائمة اليوم. انشرها لتظهر للأعضاء.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/branches/{branchId}/daily-menus',
+    icon: Icons.restaurant_menu_outlined,
+    fields: [
+      WorkflowField(
+        name: 'mealIds',
+        label: 'وجبات القائمة',
+        type: WorkflowFieldType.multiReference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/restaurant/meals',
+        labelKeys: ['name', 'mealName'],
+        subtitleKeys: ['categoryName', 'code'],
+      ),
+    ],
+    body: (values, controller) => {
+      'businessDate': riyadhBusinessDate(),
+      'items': _selectedValues(values['mealIds'])
+          .map((id) => {'mealId': id, 'enabled': true})
+          .toList(),
+    },
+  ),
 ];
 
 String _asIso(String? value) {
   final parsed = DateTime.tryParse(value ?? '');
   return (parsed ?? DateTime.now()).toUtc().toIso8601String();
 }
+
+List<String> _selectedValues(String? value) => (value ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .where((item) => item.isNotEmpty)
+    .toList(growable: false);
+
+String _moneyMinor(String? value) =>
+    ((double.tryParse(value ?? '') ?? 0) * 100).round().toString();
+
+bool _checked(String? value) => value == 'true' || value == '1';
 
 class ResourceFeature {
   const ResourceFeature({
@@ -2258,6 +4992,17 @@ const resourceFeatures = <ResourceFeature>[
     ],
   ),
   ResourceFeature(
+    title: 'قائمة اليوم',
+    subtitle: 'الوجبات التي تظهر للأعضاء اليوم وحالة النشر',
+    path: '/organizations/{organizationId}/branches/{branchId}/daily-menus/{businessDate}',
+    icon: Icons.restaurant_menu_outlined,
+    fields: [
+      ('businessDate', 'التاريخ'),
+      ('status', 'حالة النشر'),
+      ('version', 'الإصدار'),
+    ],
+  ),
+  ResourceFeature(
     title: 'تصنيفات المتجر',
     subtitle: 'تصنيفات منتجات البيع بالتجزئة',
     path: '/organizations/{organizationId}/retail/categories',
@@ -2446,9 +5191,9 @@ const memberResourceFeatures = <ResourceFeature>[
     fields: [
       ('packageName', 'الباقة'),
       ('subscriptionNumber', 'رقم الاشتراك'),
-      ('startsOn', 'البداية'),
-      ('endsOn', 'النهاية'),
-      ('remainingVisits', 'الزيارات المتبقية'),
+      ('termStart', 'البداية'),
+      ('termEnd', 'النهاية'),
+      ('visitsRemaining', 'الزيارات المتبقية'),
       ('status', 'الحالة'),
     ],
   ),
@@ -4154,16 +6899,28 @@ class MemberShell extends StatelessWidget {
   final GoController controller;
   static const destinations = [
     ('الرئيسية', Icons.home_rounded),
+    ('اكتشف', Icons.explore_outlined),
     ('عضويتي', Icons.credit_card_outlined),
     ('نشاطي', Icons.directions_run_outlined),
-    ('طلباتي', Icons.receipt_long_outlined),
-    ('الرسائل', Icons.forum_outlined),
+    ('حسابي', Icons.person_outline_rounded),
   ];
 
   @override
   Widget build(BuildContext context) {
     final pages = [
       MemberHomePage(controller: controller),
+      MemberHubPage(
+        controller: controller,
+        title: 'اكتشف واحجز',
+        subtitle: 'الباقات والخدمات والمواعيد وقائمة اليوم في مكان واحد.',
+        features: [
+          memberResourceFeatures[10],
+          memberResourceFeatures[11],
+          memberResourceFeatures[12],
+          memberResourceFeatures[13],
+          memberResourceFeatures[14],
+        ],
+      ),
       MemberHubPage(
         controller: controller,
         title: 'عضويتي',
@@ -4184,17 +6941,7 @@ class MemberShell extends StatelessWidget {
           memberResourceFeatures[7],
         ],
       ),
-      MemberHubPage(
-        controller: controller,
-        title: 'طلباتي وفواتيري',
-        subtitle: 'المشتريات والفواتير وطلبات المطعم.',
-        features: [
-          memberResourceFeatures[1],
-          memberResourceFeatures[2],
-          memberResourceFeatures[5],
-        ],
-      ),
-      MessagesPage(controller: controller),
+      MemberMorePage(controller: controller),
     ];
     return Scaffold(
       appBar: AppBar(
@@ -4286,7 +7033,11 @@ class _MemberNotificationButton extends StatelessWidget {
       isLabelVisible: count > 0,
       label: Text(count > 99 ? '99+' : '$count'),
       child: IconButton(
-        onPressed: () => controller.setTab(4),
+        onPressed: () => Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => MessagesPage(controller: controller),
+          ),
+        ),
         icon: const Icon(Icons.notifications_none_rounded),
         tooltip: 'الإشعارات',
       ),
@@ -4359,7 +7110,7 @@ class MemberHomePage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 18),
-          const SectionHeader(title: 'خدماتك'),
+          const SectionHeader(title: 'وصول سريع'),
           const SizedBox(height: 10),
           GridView.count(
             crossAxisCount: MediaQuery.sizeOf(context).width > 600 ? 3 : 2,
@@ -4368,14 +7119,23 @@ class MemberHomePage extends StatelessWidget {
             crossAxisSpacing: 10,
             mainAxisSpacing: 10,
             childAspectRatio: 1.15,
-            children: memberResourceFeatures
-                .map(
-                  (feature) => _MemberServiceCard(
-                    feature: feature,
-                    onTap: () => _openResource(context, controller, feature),
-                  ),
-                )
-                .toList(),
+            children:
+                [
+                      memberResourceFeatures[12],
+                      memberResourceFeatures[4],
+                      memberResourceFeatures[14],
+                      memberResourceFeatures[8],
+                      memberResourceFeatures[9],
+                      memberResourceFeatures[15],
+                    ]
+                    .map(
+                      (feature) => _MemberServiceCard(
+                        feature: feature,
+                        onTap: () =>
+                            _openResource(context, controller, feature),
+                      ),
+                    )
+                    .toList(),
           ),
         ],
       ),
@@ -4415,6 +7175,87 @@ class MemberHubPage extends StatelessWidget {
             ),
           )
           .toList(),
+    ),
+  );
+}
+
+class MemberMorePage extends StatelessWidget {
+  const MemberMorePage({super.key, required this.controller});
+  final GoController controller;
+
+  @override
+  Widget build(BuildContext context) => PageFrame(
+    title: 'حسابي',
+    subtitle: 'الطلبات والفواتير والتواصل وإعدادات الحساب.',
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        GridView.count(
+          crossAxisCount: MediaQuery.sizeOf(context).width > 600 ? 3 : 2,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          crossAxisSpacing: 10,
+          mainAxisSpacing: 10,
+          childAspectRatio: 1.15,
+          children:
+              [
+                    memberResourceFeatures[1],
+                    memberResourceFeatures[2],
+                    memberResourceFeatures[5],
+                    memberResourceFeatures[9],
+                    memberResourceFeatures[15],
+                  ]
+                  .map(
+                    (feature) => _MemberServiceCard(
+                      feature: feature,
+                      onTap: () => _openResource(context, controller, feature),
+                    ),
+                  )
+                  .toList(),
+        ),
+        const SizedBox(height: 16),
+        Card(
+          child: Column(
+            children: [
+              ListTile(
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => MessagesPage(controller: controller),
+                  ),
+                ),
+                leading: const Icon(Icons.notifications_none_rounded),
+                title: const Text('الإشعارات'),
+                subtitle: const Text('تابع تنبيهات النادي والعمليات الجديدة'),
+                trailing: const Icon(Icons.chevron_left_rounded),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => AccountPage(controller: controller),
+                  ),
+                ),
+                leading: const Icon(Icons.manage_accounts_outlined),
+                title: const Text('إعدادات الحساب'),
+                subtitle: const Text('المظهر والإشعارات وأمان الجلسة'),
+                trailing: const Icon(Icons.chevron_left_rounded),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                onTap: controller.logout,
+                leading: Icon(
+                  Icons.logout_rounded,
+                  color: Theme.of(context).colorScheme.error,
+                ),
+                title: Text(
+                  'تسجيل الخروج',
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     ),
   );
 }
@@ -4809,9 +7650,11 @@ class FilesPage extends StatefulWidget {
     super.key,
     required this.controller,
     this.memberMode = false,
+    this.initialOwnerId,
   });
   final GoController controller;
   final bool memberMode;
+  final String? initialOwnerId;
 
   @override
   State<FilesPage> createState() => _FilesPageState();
@@ -4835,6 +7678,7 @@ class _FilesPageState extends State<FilesPage> {
   @override
   void initState() {
     super.initState();
+    ownerId = widget.initialOwnerId;
     unawaited(load());
   }
 
@@ -5235,6 +8079,13 @@ class _FilesPageState extends State<FilesPage> {
           ],
         ),
       ),
+      floatingActionButton: canUpload
+          ? FloatingActionButton.extended(
+              onPressed: uploading ? null : () => unawaited(pickAndUpload()),
+              icon: const Icon(Icons.attach_file_rounded),
+              label: const Text('إضافة مرفق'),
+            )
+          : null,
     );
   }
 }
@@ -6113,6 +8964,189 @@ class MemberDetailPage extends StatefulWidget {
   State<MemberDetailPage> createState() => _MemberDetailPageState();
 }
 
+MobileWorkflow _editMemberWorkflow(
+  GoController controller,
+  String memberId,
+  Map<String, dynamic> member,
+) {
+  String contact(String type) {
+    final contacts =
+        (member['contacts'] as List?)?.whereType<Map>() ?? const [];
+    return contacts
+            .where((item) => item['type']?.toString() == type)
+            .map((item) => item['value']?.toString() ?? '')
+            .firstOrNull ??
+        '';
+  }
+
+  final version = int.tryParse('${member['version'] ?? 1}') ?? 1;
+  return MobileWorkflow(
+    operationId: 'editMember:$memberId',
+    title: 'تعديل بيانات العضو',
+    description: 'حدّث البيانات الأساسية ووسائل التواصل التي يعتمد عليها الدخول والإشعارات.',
+    submitLabel: 'حفظ التعديلات',
+    successMessage: 'تم تحديث ملف العضو.',
+    method: 'PATCH',
+    path: '/organizations/{organizationId}/members/$memberId',
+    icon: Icons.edit_outlined,
+    fields: [
+      WorkflowField(
+        name: 'name',
+        label: 'الاسم الكامل',
+        required: true,
+        initialValue: member['name']?.toString() ?? '',
+      ),
+      WorkflowField(
+        name: 'gender',
+        label: 'النوع',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: member['gender']?.toString() ?? 'UNSPECIFIED',
+        choices: [
+          WorkflowChoice('MALE', 'ذكر'),
+          WorkflowChoice('FEMALE', 'أنثى'),
+          WorkflowChoice('UNSPECIFIED', 'غير محدد'),
+        ],
+      ),
+      WorkflowField(
+        name: 'birthDate',
+        label: 'تاريخ الميلاد',
+        type: WorkflowFieldType.date,
+        autoFillDate: false,
+        initialValue: member['birthDate']?.toString() ?? '',
+      ),
+      WorkflowField(
+        name: 'nationalId',
+        label: 'رقم الهوية',
+        initialValue: member['nationalId']?.toString() ?? '',
+      ),
+      WorkflowField(
+        name: 'phone',
+        label: 'الجوال الأساسي',
+        type: WorkflowFieldType.phone,
+        initialValue: contact('PHONE'),
+      ),
+      WorkflowField(
+        name: 'email',
+        label: 'البريد الأساسي',
+        type: WorkflowFieldType.email,
+        initialValue: contact('EMAIL'),
+      ),
+      WorkflowField(
+        name: 'status',
+        label: 'حالة الملف',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: member['status']?.toString() ?? 'ACTIVE',
+        choices: [
+          WorkflowChoice('ACTIVE', 'نشط'),
+          WorkflowChoice('INACTIVE', 'غير نشط'),
+        ],
+      ),
+      WorkflowField(
+        name: 'notes',
+        label: 'ملاحظات',
+        type: WorkflowFieldType.textarea,
+        initialValue: member['notes']?.toString() ?? '',
+      ),
+    ],
+    body: (values, controller) => {
+      'expectedVersion': version,
+      'name': values['name']?.trim(),
+      'gender': values['gender'],
+      'birthDate': values['birthDate']?.isEmpty == true
+          ? null
+          : values['birthDate'],
+      'nationalId': values['nationalId']?.trim().isEmpty == true
+          ? null
+          : values['nationalId']?.trim(),
+      'status': values['status'],
+      'notes': values['notes']?.trim().isEmpty == true
+          ? null
+          : values['notes']?.trim(),
+      'contacts': [
+        if (values['phone']?.trim().isNotEmpty == true)
+          {
+            'type': 'PHONE',
+            'value': values['phone']?.trim(),
+            'isPrimary': true,
+          },
+        if (values['email']?.trim().isNotEmpty == true)
+          {
+            'type': 'EMAIL',
+            'value': values['email']?.trim(),
+            'isPrimary': true,
+          },
+      ],
+    },
+  );
+}
+
+MobileWorkflow _guardianWorkflow(String memberId) => MobileWorkflow(
+  operationId: 'addGuardian:$memberId',
+  title: 'إضافة ولي أمر',
+  description:
+      'سجل ولي أمر جديد وحدد ما يستطيع الاطلاع عليه أو إدارته في بوابة العضو.',
+  submitLabel: 'ربط ولي الأمر',
+  successMessage: 'تم ربط ولي الأمر بالعضو.',
+  method: 'POST',
+  path: '/organizations/{organizationId}/members/$memberId/guardian-links',
+  icon: Icons.family_restroom_outlined,
+  fields: const [
+    WorkflowField(name: 'name', label: 'اسم ولي الأمر', required: true),
+    WorkflowField(
+      name: 'phone',
+      label: 'رقم الجوال',
+      type: WorkflowFieldType.phone,
+    ),
+    WorkflowField(
+      name: 'relationship',
+      label: 'صلة القرابة',
+      type: WorkflowFieldType.select,
+      required: true,
+      initialValue: 'FATHER',
+      choices: [
+        WorkflowChoice('FATHER', 'الأب'),
+        WorkflowChoice('MOTHER', 'الأم'),
+        WorkflowChoice('LEGAL_GUARDIAN', 'وصي قانوني'),
+        WorkflowChoice('OTHER', 'أخرى'),
+      ],
+    ),
+    WorkflowField(
+      name: 'isPrimary',
+      label: 'ولي الأمر الأساسي',
+      type: WorkflowFieldType.checkbox,
+      initialValue: 'true',
+    ),
+    WorkflowField(
+      name: 'canView',
+      label: 'يمكنه مشاهدة بيانات العضو',
+      type: WorkflowFieldType.checkbox,
+      initialValue: 'true',
+    ),
+    WorkflowField(
+      name: 'canBook',
+      label: 'يمكنه إجراء الحجوزات',
+      type: WorkflowFieldType.checkbox,
+    ),
+    WorkflowField(
+      name: 'canManageMembership',
+      label: 'يمكنه إدارة العضوية',
+      type: WorkflowFieldType.checkbox,
+    ),
+  ],
+  body: (values, controller) => {
+    'name': values['name']?.trim(),
+    if (values['phone']?.trim().isNotEmpty == true)
+      'phone': values['phone']?.trim(),
+    'relationship': values['relationship'],
+    'isPrimary': _checked(values['isPrimary']),
+    'canView': _checked(values['canView']),
+    'canBook': _checked(values['canBook']),
+    'canManageMembership': _checked(values['canManageMembership']),
+  },
+);
+
 class _MemberDetailPageState extends State<MemberDetailPage> {
   Map<String, dynamic> member = {};
   bool loading = true;
@@ -6255,6 +9289,84 @@ class _MemberDetailPageState extends State<MemberDetailPage> {
     }
   }
 
+  Future<void> openMemberWorkflow(MobileWorkflow workflow) async {
+    await _openWorkflow(context, widget.controller, workflow);
+    if (mounted) await load();
+  }
+
+  Future<void> showBlockHistory() async {
+    setState(() => acting = true);
+    try {
+      final data = await widget.controller.api.request(
+        '/organizations/${widget.controller.organizationId}/members/${widget.memberId}/block-history',
+      );
+      final rows = data is List
+          ? data.whereType<Map>().toList()
+          : data is Map && data['items'] is List
+          ? (data['items'] as List).whereType<Map>().toList()
+          : <Map>[];
+      if (!mounted) return;
+      await showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        isScrollControlled: true,
+        builder: (context) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 4, 18, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'سجل حظر العضو',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
+                ),
+                const SizedBox(height: 12),
+                if (rows.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 28),
+                    child: Text(
+                      'لا توجد عمليات حظر مسجلة لهذا العضو.',
+                      textAlign: TextAlign.center,
+                    ),
+                  )
+                else
+                  Flexible(
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: rows.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final row = rows[index];
+                        final lifted = row['liftedAt'] != null;
+                        return ListTile(
+                          leading: Icon(
+                            lifted
+                                ? Icons.lock_open_outlined
+                                : Icons.block_outlined,
+                            color: lifted ? Colors.green : Colors.red,
+                          ),
+                          title: Text(row['reason']?.toString() ?? 'عملية حظر'),
+                          subtitle: Text(
+                            '${row['blockedAt'] ?? row['createdAt'] ?? ''}'
+                            '${lifted ? '\nتم رفعه: ${row['liftedAt']}' : ''}',
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+    } catch (exception) {
+      if (mounted) setState(() => error = _errorMessage(exception));
+    } finally {
+      if (mounted) setState(() => acting = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final name = member['name']?.toString() ?? 'ملف العضو';
@@ -6386,15 +9498,52 @@ class _MemberDetailPageState extends State<MemberDetailPage> {
                 label: const Text('إعادة تعيين كلمة المرور'),
               ),
             ],
+            if (widget.controller.can('members.manage')) ...[
+              const SizedBox(height: 6),
+              OutlinedButton.icon(
+                onPressed: acting
+                    ? null
+                    : () => unawaited(
+                        openMemberWorkflow(
+                          _editMemberWorkflow(
+                            widget.controller,
+                            widget.memberId,
+                            member,
+                          ),
+                        ),
+                      ),
+                icon: const Icon(Icons.edit_outlined),
+                label: const Text('تعديل بيانات العضو'),
+              ),
+              OutlinedButton.icon(
+                onPressed: acting
+                    ? null
+                    : () => unawaited(
+                        openMemberWorkflow(_guardianWorkflow(widget.memberId)),
+                      ),
+                icon: const Icon(Icons.family_restroom_outlined),
+                label: const Text('إضافة ولي أمر'),
+              ),
+            ],
             if (widget.controller.can('members.block'))
-              FilledButton.tonalIcon(
-                onPressed: acting ? null : toggleBlock,
-                icon: const Icon(Icons.block_outlined),
-                label: Text(
-                  member['activeBlock'] != null || member['blocked'] == true
-                      ? 'رفع الحظر عن العضو'
-                      : 'حظر العضو',
-                ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: acting ? null : toggleBlock,
+                    icon: const Icon(Icons.block_outlined),
+                    label: Text(
+                      member['activeBlock'] != null || member['blocked'] == true
+                          ? 'رفع الحظر عن العضو'
+                          : 'حظر العضو',
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: acting ? null : showBlockHistory,
+                    icon: const Icon(Icons.history_rounded),
+                    label: const Text('عرض سجل الحظر'),
+                  ),
+                ],
               ),
             if (error != null)
               Padding(
@@ -6536,15 +9685,20 @@ class _OperationsPageState extends State<OperationsPage> {
                             ),
                           ),
                         ),
-                      if (controller.can('finance.invoices.read'))
+                      if (controller.can('sales.checkout') ||
+                          controller.can('sales.read') ||
+                          controller.can('finance.invoices.read') ||
+                          controller.can('finance.payments.record') ||
+                          controller.can('finance.cash-shifts.manage'))
                         OperationButton(
                           icon: Icons.point_of_sale_outlined,
                           title: 'نقطة البيع',
                           color: Colors.orange,
-                          onPressed: () => _openResource(
-                            context,
-                            controller,
-                            resourceFeatures[3],
+                          onPressed: () => Navigator.of(context).push(
+                            MaterialPageRoute<void>(
+                              builder: (_) =>
+                                  PointOfSaleMobilePage(controller: controller),
+                            ),
                           ),
                         ),
                       if (controller.can('restaurant.orders.read'))
@@ -6811,13 +9965,22 @@ void _openResource(
     MaterialPageRoute<void>(
       builder: (_) => feature.path.endsWith('/daily-menu')
           ? MemberDailyMenuPage(controller: controller)
+          : feature.path.endsWith('/barcode')
+          ? MemberBarcodePage(controller: controller)
+          : feature.path.startsWith('/self/') &&
+                feature.path.endsWith('/training-plans')
+          ? MemberTrainingPlansPage(controller: controller)
           : feature.path.contains('/feedback-cases')
           ? FeedbackCasesPage(
               controller: controller,
               memberMode: !controller.staffMode,
             )
           : feature.path.endsWith('/files')
-          ? FilesPage(controller: controller, memberMode: !controller.staffMode)
+          ? FilesPage(
+              controller: controller,
+              memberMode: !controller.staffMode,
+              initialOwnerId: memberFilterId,
+            )
           : ResourcePage(
               controller: controller,
               feature: feature,
@@ -6825,6 +9988,730 @@ void _openResource(
             ),
     ),
   );
+}
+
+class MemberTrainingPlansPage extends StatefulWidget {
+  const MemberTrainingPlansPage({super.key, required this.controller});
+  final GoController controller;
+
+  @override
+  State<MemberTrainingPlansPage> createState() =>
+      _MemberTrainingPlansPageState();
+}
+
+class _MemberTrainingPlansPageState extends State<MemberTrainingPlansPage> {
+  List<Map<String, dynamic>> plans = [];
+  bool loading = true;
+  String? busyItemId;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(load());
+  }
+
+  dynamic _field(Map row, String camel, [String? snake]) =>
+      row[camel] ?? (snake == null ? null : row[snake]);
+
+  List<Map<String, dynamic>> _rows(dynamic data) {
+    final values = data is List
+        ? data
+        : data is Map && data['items'] is List
+        ? data['items'] as List
+        : const <dynamic>[];
+    return values
+        .whereType<Map>()
+        .map((row) => Map<String, dynamic>.from(row))
+        .toList();
+  }
+
+  Future<void> load() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      final controller = widget.controller;
+      final memberId = controller.selectedMemberId;
+      if (memberId == null || memberId.isEmpty) {
+        throw const ApiFailure('تعذر تحديد ملف العضو الحالي.');
+      }
+      final data = await controller.api.request(
+        '/self/organizations/${controller.organizationId}/members/$memberId/training-plans',
+        query: const {'limit': '100'},
+      );
+      plans = _rows(data);
+    } catch (exception) {
+      error = _errorMessage(exception);
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  Future<void> _transition(
+    Map<String, dynamic> plan,
+    Map<String, dynamic> item,
+  ) async {
+    final status = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                _field(item, 'exerciseName', 'exercise_name')?.toString() ??
+                    'التمرين',
+                style: Theme.of(sheetContext).textTheme.titleLarge
+                    ?.copyWith(fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'سجّل النتيجة بعد تنفيذ التمرين. لا يمكن تعديلها من بوابة العضو بعد الحفظ.',
+                style: TextStyle(
+                  color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 18),
+              FilledButton.icon(
+                onPressed: () => Navigator.pop(sheetContext, 'COMPLETED'),
+                icon: const Icon(Icons.check_circle_outline_rounded),
+                label: const Text('تم إنجاز التمرين'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: () => Navigator.pop(sheetContext, 'SKIPPED'),
+                icon: const Icon(Icons.skip_next_rounded),
+                label: const Text('تخطي هذا التمرين'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (status == null || !mounted) return;
+    final planId = _field(plan, 'id')?.toString() ?? '';
+    final itemId = _field(item, 'id')?.toString() ?? '';
+    final memberId = widget.controller.selectedMemberId ?? '';
+    if (planId.isEmpty || itemId.isEmpty || memberId.isEmpty) return;
+    setState(() {
+      busyItemId = itemId;
+      error = null;
+    });
+    try {
+      await widget.controller.api.request(
+        '/self/organizations/${widget.controller.organizationId}/members/$memberId/training-plans/$planId/items/$itemId/transitions',
+        method: 'POST',
+        body: {'status': status},
+      );
+      await load();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            status == 'COMPLETED'
+                ? 'رائع! تم تسجيل إنجاز التمرين.'
+                : 'تم تسجيل تخطي التمرين.',
+          ),
+        ),
+      );
+    } catch (exception) {
+      if (mounted) {
+        setState(() => error = _errorMessage(exception));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(_errorMessage(exception))));
+      }
+    } finally {
+      if (mounted) setState(() => busyItemId = null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final allItems = plans.expand((plan) {
+      final value = _field(plan, 'items');
+      return value is List
+          ? value.whereType<Map>()
+          : const Iterable<Map>.empty();
+    }).toList();
+    final completed = allItems
+        .where(
+          (item) =>
+              _field(item, 'completionStatus', 'completion_status') ==
+              'COMPLETED',
+        )
+        .length;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'خططي التدريبية',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+        actions: [
+          IconButton(
+            onPressed: loading ? null : () => unawaited(load()),
+            icon: const Icon(Icons.refresh_rounded),
+            tooltip: 'تحديث الخطط',
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: load,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 36),
+          children: [
+            if (!loading && plans.isNotEmpty)
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [goInk, Color(0xFF33332E)],
+                  ),
+                  borderRadius: BorderRadius.circular(22),
+                ),
+                child: Row(
+                  children: [
+                    const CircleAvatar(
+                      radius: 25,
+                      backgroundColor: goYellow,
+                      child: Icon(Icons.fitness_center_rounded, color: goInk),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'رحلة تدريبك',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w900,
+                              fontSize: 16,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            allItems.isEmpty
+                                ? '${plans.length} خطط مسجلة'
+                                : '$completed من ${allItems.length} تمارين مكتملة',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (allItems.isNotEmpty)
+                      Text(
+                        '${((completed / allItems.length) * 100).round()}٪',
+                        textDirection: TextDirection.rtl,
+                        style: const TextStyle(
+                          color: goYellow,
+                          fontWeight: FontWeight.w900,
+                          fontSize: 22,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            if (!loading && plans.isNotEmpty) const SizedBox(height: 14),
+            if (loading)
+              const SizedBox(
+                height: 420,
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (error != null && plans.isEmpty)
+              _ResourceMessage(
+                icon: Icons.cloud_off_outlined,
+                title: 'تعذر تحميل خطط التدريب',
+                body: error!,
+                action: load,
+              )
+            else if (plans.isEmpty)
+              const _ResourceMessage(
+                icon: Icons.fitness_center_outlined,
+                title: 'لا توجد خطة تدريب حالية',
+                body: 'عند إسناد خطة لك من المدرب ستظهر هنا التمارين وتعليمات تنفيذها.',
+              )
+            else
+              ...plans.map(_planCard),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _planCard(Map<String, dynamic> plan) {
+    final itemsValue = _field(plan, 'items');
+    final items = itemsValue is List
+        ? itemsValue
+              .whereType<Map>()
+              .map((item) => Map<String, dynamic>.from(item))
+              .toList()
+        : <Map<String, dynamic>>[];
+    final completed = items
+        .where(
+          (item) =>
+              _field(item, 'completionStatus', 'completion_status') ==
+              'COMPLETED',
+        )
+        .length;
+    final status = _field(plan, 'status')?.toString() ?? '';
+    final title = _field(plan, 'name')?.toString() ?? 'خطة تدريب';
+    final goal = _field(plan, 'goal')?.toString() ?? '';
+    final trainer =
+        _field(plan, 'trainerName', 'trainer_name')?.toString() ?? '';
+    final startsOn = _field(plan, 'startsOn', 'starts_on')?.toString() ?? '';
+    final endsOn = _field(plan, 'endsOn', 'ends_on')?.toString() ?? '';
+    final days = <int, List<Map<String, dynamic>>>{};
+    for (final item in items) {
+      final day =
+          int.tryParse('${_field(item, 'dayNumber', 'day_number') ?? 1}') ?? 1;
+      days.putIfAbsent(day, () => []).add(item);
+    }
+    return Card(
+      margin: const EdgeInsets.only(bottom: 14),
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        initiallyExpanded: status == 'ACTIVE',
+        tilePadding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+        childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 16),
+        leading: CircleAvatar(
+          backgroundColor: status == 'ACTIVE'
+              ? goYellow.withValues(alpha: .2)
+              : Theme.of(context).colorScheme.surfaceContainerHighest,
+          child: Icon(
+            status == 'ACTIVE' ? Icons.play_arrow_rounded : Icons.check_rounded,
+            color: status == 'ACTIVE' ? goInk : null,
+          ),
+        ),
+        title: Text(title, style: const TextStyle(fontWeight: FontWeight.w900)),
+        subtitle: Padding(
+          padding: const EdgeInsets.only(top: 5),
+          child: Text(
+            [
+              if (trainer.isNotEmpty) 'المدرب: $trainer',
+              if (items.isNotEmpty) '$completed من ${items.length} مكتمل',
+            ].join(' • '),
+            style: const TextStyle(fontSize: 11),
+          ),
+        ),
+        children: [
+          if (goal.isNotEmpty)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.primaryContainer
+                    .withValues(alpha: .42),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Text('الهدف: $goal', style: const TextStyle(height: 1.5)),
+            ),
+          if (startsOn.isNotEmpty || endsOn.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Row(
+                children: [
+                  const Icon(Icons.date_range_outlined, size: 18),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: Text(
+                      '${_shortDate(startsOn)}${endsOn.isNotEmpty ? ' — ${_shortDate(endsOn)}' : ''}',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          if (items.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 20),
+              child: Text('لا توجد تمارين داخل هذه الخطة.'),
+            )
+          else
+            ...days.entries.map(
+              (entry) => _trainingDay(
+                plan,
+                entry.key,
+                entry.value,
+                status == 'ACTIVE',
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _trainingDay(
+    Map<String, dynamic> plan,
+    int day,
+    List<Map<String, dynamic>> items,
+    bool active,
+  ) {
+    items.sort(
+      (a, b) =>
+          (int.tryParse(
+                    '${_field(a, 'sequenceNumber', 'sequence_number') ?? 0}',
+                  ) ??
+                  0)
+              .compareTo(
+                int.tryParse(
+                      '${_field(b, 'sequenceNumber', 'sequence_number') ?? 0}',
+                    ) ??
+                    0,
+              ),
+    );
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+            child: Text(
+              'اليوم $day',
+              style: const TextStyle(fontWeight: FontWeight.w900),
+            ),
+          ),
+          ...items.map((item) => _exerciseCard(plan, item, active)),
+        ],
+      ),
+    );
+  }
+
+  Widget _exerciseCard(
+    Map<String, dynamic> plan,
+    Map<String, dynamic> item,
+    bool planActive,
+  ) {
+    final id = _field(item, 'id')?.toString() ?? '';
+    final status =
+        _field(item, 'completionStatus', 'completion_status')?.toString() ??
+        'PENDING';
+    final name =
+        _field(item, 'exerciseName', 'exercise_name')?.toString() ?? 'تمرين';
+    final instructions = _field(item, 'instructions')?.toString() ?? '';
+    final sets = _field(item, 'sets')?.toString() ?? '';
+    final repetitions = _field(item, 'repetitions')?.toString() ?? '';
+    final minutes =
+        _field(item, 'durationMinutes', 'duration_minutes')?.toString() ?? '';
+    final pending = status == 'PENDING';
+    final busy = busyItemId == id;
+    final accent = status == 'COMPLETED'
+        ? Colors.green
+        : status == 'SKIPPED'
+        ? Colors.orange
+        : goYellow;
+    final meta = [
+      if (sets.isNotEmpty) '$sets مجموعات',
+      if (repetitions.isNotEmpty) '$repetitions تكرار',
+      if (minutes.isNotEmpty) '$minutes دقيقة',
+    ];
+    return Container(
+      margin: const EdgeInsets.only(bottom: 9),
+      padding: const EdgeInsets.all(13),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest
+            .withValues(alpha: .42),
+        borderRadius: BorderRadius.circular(16),
+        border: Border(right: BorderSide(color: accent, width: 4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                status == 'COMPLETED'
+                    ? Icons.check_circle_rounded
+                    : status == 'SKIPPED'
+                    ? Icons.skip_next_rounded
+                    : Icons.radio_button_unchecked_rounded,
+                color: accent,
+              ),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      name,
+                      style: const TextStyle(fontWeight: FontWeight.w900),
+                    ),
+                    if (meta.isNotEmpty) ...[
+                      const SizedBox(height: 3),
+                      Text(
+                        meta.join(' • '),
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              Text(
+                status == 'COMPLETED'
+                    ? 'مكتمل'
+                    : status == 'SKIPPED'
+                    ? 'تم التخطي'
+                    : 'بانتظار التنفيذ',
+                style: TextStyle(
+                  color: accent,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
+          ),
+          if (instructions.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              instructions,
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 12,
+                height: 1.5,
+              ),
+            ),
+          ],
+          if (pending && planActive) ...[
+            const SizedBox(height: 10),
+            FilledButton.tonalIcon(
+              onPressed: busy ? null : () => unawaited(_transition(plan, item)),
+              icon: busy
+                  ? const SizedBox.square(
+                      dimension: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.add_task_rounded, size: 18),
+              label: const Text('تسجيل نتيجة التمرين'),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  String _shortDate(String value) => value.length >= 10
+      ? value.substring(0, 10).split('-').reversed.join('/')
+      : value;
+}
+
+class MemberBarcodePage extends StatefulWidget {
+  const MemberBarcodePage({super.key, required this.controller});
+  final GoController controller;
+
+  @override
+  State<MemberBarcodePage> createState() => _MemberBarcodePageState();
+}
+
+class _MemberBarcodePageState extends State<MemberBarcodePage> {
+  Map<String, dynamic>? credential;
+  bool loading = true;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(load());
+  }
+
+  Future<void> load() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      final controller = widget.controller;
+      final data = await controller.api.request(
+        '/self/organizations/${controller.organizationId}/members/${controller.selectedMemberId}/barcode',
+      );
+      credential = data is Map
+          ? Map<String, dynamic>.from(data)
+          : <String, dynamic>{};
+    } catch (exception) {
+      credential = null;
+      if (exception is! ApiFailure || !exception.isNotFound) {
+        error = _errorMessage(exception);
+      }
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final value =
+        credential?['credentialValue']?.toString() ??
+        credential?['value']?.toString() ??
+        credential?['code']?.toString() ??
+        '';
+    final memberName =
+        credential?['memberName']?.toString() ?? widget.controller.displayName;
+    final memberNumber =
+        credential?['memberNumber']?.toString() ??
+        widget.controller.selectedSelfMember?['memberNumber']?.toString() ??
+        '';
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'بطاقة دخولي',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+        actions: [
+          IconButton(
+            onPressed: loading ? null : () => unawaited(load()),
+            icon: const Icon(Icons.refresh_rounded),
+            tooltip: 'تحديث البطاقة',
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: load,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 36),
+          children: [
+            if (loading)
+              const SizedBox(
+                height: 420,
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (error != null)
+              _ResourceMessage(
+                icon: Icons.cloud_off_outlined,
+                title: 'تعذر تحميل بطاقة الدخول',
+                body: error!,
+                action: load,
+              )
+            else if (value.isEmpty)
+              const _ResourceMessage(
+                icon: Icons.qr_code_2_rounded,
+                title: 'لا توجد بطاقة دخول نشطة',
+                body: 'اطلب من استقبال النادي إصدار بطاقة دخول لحسابك، ثم اسحب الشاشة للتحديث.',
+              )
+            else ...[
+              Container(
+                padding: const EdgeInsets.fromLTRB(24, 24, 24, 28),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(28),
+                  border: Border.all(color: goInk, width: 2),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Color(0x22000000),
+                      blurRadius: 28,
+                      offset: Offset(0, 12),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Image.asset(
+                          'assets/go-fitness-emblem.png',
+                          width: 56,
+                          height: 42,
+                          fit: BoxFit.contain,
+                        ),
+                        const SizedBox(width: 10),
+                        const Text(
+                          'GO FITNESS',
+                          textDirection: TextDirection.ltr,
+                          style: TextStyle(
+                            color: goInk,
+                            fontSize: 20,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 1.2,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 24),
+                    Text(
+                      memberName,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: goInk,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    if (memberNumber.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        memberNumber,
+                        textDirection: TextDirection.ltr,
+                        style: const TextStyle(
+                          color: Colors.black54,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 26),
+                    Semantics(
+                      label: 'باركود دخول العضو $memberNumber',
+                      image: true,
+                      child: barcode_ui.BarcodeWidget(
+                        barcode: barcode_ui.Barcode.code39(),
+                        data: value,
+                        width: 290,
+                        height: 104,
+                        drawText: false,
+                        color: Colors.black,
+                        backgroundColor: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    SelectableText(
+                      value,
+                      textDirection: TextDirection.ltr,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: goInk,
+                        fontFamily: 'monospace',
+                        fontSize: 16,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 2.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(Icons.lightbulb_outline, color: Colors.amber),
+                      SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'ارفع سطوع الشاشة وقرّب الباركود من قارئ البوابة. البطاقة شخصية ولا ينبغي مشاركتها.',
+                          style: TextStyle(fontSize: 12, height: 1.6),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class MemberDailyMenuPage extends StatefulWidget {
@@ -6987,7 +10874,7 @@ class _MemberDailyMenuPageState extends State<MemberDailyMenuPage> {
                             ),
                           ),
                           Text(
-                            '${_money(meal['priceMinor'] ?? 0)} ر.س',
+                            _money(meal['priceMinor'] ?? 0),
                             style: const TextStyle(fontWeight: FontWeight.w900),
                           ),
                         ],
@@ -7097,7 +10984,8 @@ class _ResourcePageState extends State<ResourcePage> {
     final candidateWorkflow = _workflowForFeature(widget.feature);
     final workflow =
         candidateWorkflow != null &&
-            _canRunWorkflow(widget.controller, candidateWorkflow)
+            _canRunWorkflow(widget.controller, candidateWorkflow) &&
+            (!widget.feature.path.contains('/daily-menus/') || rows.isEmpty)
         ? candidateWorkflow
         : null;
     final visible = rows
@@ -7209,6 +11097,13 @@ class _ResourceCard extends StatelessWidget {
   final Future<void> Function() onChanged;
   @override
   Widget build(BuildContext context) {
+    final editWorkflow = _editWorkflowForFeature(controller, feature, row);
+    final contextualWorkflow = _contextWorkflowForFeature(
+      controller,
+      feature,
+      row,
+    );
+    final recordActions = _recordActions(controller, feature, row);
     final values = feature.fields
         .map((field) => (field.$2, _displayValue(field.$1, row[field.$1])))
         .where((entry) => entry.$2.isNotEmpty)
@@ -7267,23 +11162,58 @@ class _ResourceCard extends StatelessWidget {
                     ),
                   ),
                 ),
-                if (_recordActions(controller, feature, row).isNotEmpty) ...[
+                if (editWorkflow != null ||
+                    contextualWorkflow != null ||
+                    recordActions.isNotEmpty) ...[
                   const Divider(height: 22),
                   Align(
                     alignment: AlignmentDirectional.centerEnd,
-                    child: FilledButton.tonalIcon(
-                      onPressed: () => Navigator.of(context).push(
-                        MaterialPageRoute<void>(
-                          builder: (_) => RecordActionsPage(
-                            controller: controller,
-                            feature: feature,
-                            row: row,
-                            onChanged: onChanged,
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        if (editWorkflow != null)
+                          OutlinedButton.icon(
+                            onPressed: () async {
+                              await _openWorkflow(
+                                context,
+                                controller,
+                                editWorkflow,
+                              );
+                              await onChanged();
+                            },
+                            icon: const Icon(Icons.edit_outlined, size: 18),
+                            label: const Text('تعديل البيانات'),
                           ),
-                        ),
-                      ),
-                      icon: const Icon(Icons.tune_rounded, size: 18),
-                      label: const Text('إجراءات السجل'),
+                        if (contextualWorkflow != null)
+                          FilledButton.tonalIcon(
+                            onPressed: () async {
+                              await _openWorkflow(
+                                context,
+                                controller,
+                                contextualWorkflow,
+                              );
+                              await onChanged();
+                            },
+                            icon: Icon(contextualWorkflow.icon, size: 18),
+                            label: Text(contextualWorkflow.submitLabel),
+                          ),
+                        if (recordActions.isNotEmpty)
+                          FilledButton.tonalIcon(
+                            onPressed: () => Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder: (_) => RecordActionsPage(
+                                  controller: controller,
+                                  feature: feature,
+                                  row: row,
+                                  onChanged: onChanged,
+                                ),
+                              ),
+                            ),
+                            icon: const Icon(Icons.tune_rounded, size: 18),
+                            label: const Text('إجراءات السجل'),
+                          ),
+                      ],
                     ),
                   ),
                 ],
@@ -7294,6 +11224,457 @@ class _ResourceCard extends StatelessWidget {
       ),
     );
   }
+}
+
+MobileWorkflow? _contextWorkflowForFeature(
+  GoController controller,
+  ResourceFeature feature,
+  Map<String, dynamic> row,
+) {
+  final status = row['status']?.toString() ?? '';
+  final id = _rowId(row, ['id', 'shiftId', 'leadId', 'followUpId']);
+  if (id.isEmpty) return null;
+  if (feature.path.startsWith('/self/') &&
+      feature.path.endsWith('/subscriptions')) {
+    final schedules = row['freezeSchedules'] is List
+        ? (row['freezeSchedules'] as List).whereType<Map>()
+        : const Iterable<Map>.empty();
+    final pendingSchedule = schedules
+        .where((item) => item['status']?.toString() == 'PENDING')
+        .firstOrNull;
+    final version = int.tryParse('${row['version'] ?? 1}') ?? 1;
+    final base =
+        '/self/organizations/${controller.organizationId}/members/${controller.selectedMemberId}/subscriptions/$id';
+    if (pendingSchedule != null) {
+      final scheduleId = pendingSchedule['id']?.toString() ?? '';
+      if (scheduleId.isNotEmpty) {
+        return MobileWorkflow(
+          operationId: 'cancelSelfFreezeSchedule:$scheduleId',
+          title: 'إدارة موعد التجميد',
+          description:
+              'التجميد مجدول ليبدأ في ${_displayValue('scheduledStartAt', pendingSchedule['scheduledStartAt'])}. يمكنك إلغاء الموعد قبل حلول وقت تنفيذه.',
+          submitLabel: 'إلغاء التجميد المجدول',
+          successMessage: 'تم إلغاء موعد التجميد المجدول.',
+          method: 'POST',
+          path: '$base/freeze-schedules/$scheduleId/cancellations',
+          icon: Icons.event_busy_outlined,
+          fields: [
+            WorkflowField(
+              name: 'reason',
+              label: 'سبب إلغاء الموعد',
+              type: WorkflowFieldType.textarea,
+              required: true,
+            ),
+          ],
+          body: (values, controller) => {
+            'expectedVersion': version,
+            'reason': values['reason']?.trim(),
+          },
+        );
+      }
+    }
+    if (const {'ACTIVE', 'ACTIVE_PROVISIONAL'}.contains(status)) {
+      return MobileWorkflow(
+        operationId: 'freezeSelfSubscription:$id',
+        title: 'تجميد العضوية',
+        description: 'ابدأ التجميد الآن أو حدّد موعدًا لاحقًا. سيتحقق النظام من سياسة الباقة قبل الحفظ والتنفيذ.',
+        submitLabel: 'تأكيد طلب التجميد',
+        successMessage: 'تم تسجيل طلب تجميد العضوية.',
+        method: 'POST',
+        path: '$base/freezes',
+        icon: Icons.ac_unit_rounded,
+        fields: [
+          WorkflowField(
+            name: 'freezeMode',
+            label: 'موعد بدء التجميد',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: 'NOW',
+            choices: [
+              WorkflowChoice('NOW', 'الآن'),
+              WorkflowChoice('LATER', 'موعد لاحق'),
+            ],
+          ),
+          WorkflowField(
+            name: 'scheduledStartAt',
+            label: 'تاريخ ووقت البدء',
+            type: WorkflowFieldType.dateTime,
+            required: true,
+            visibleWhenField: 'freezeMode',
+            visibleWhenValues: ['LATER'],
+          ),
+          WorkflowField(
+            name: 'requestedDays',
+            label: 'عدد أيام التجميد',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: '7',
+          ),
+          WorkflowField(
+            name: 'reason',
+            label: 'سبب التجميد',
+            type: WorkflowFieldType.textarea,
+            required: true,
+          ),
+        ],
+        body: (values, controller) => {
+          'expectedVersion': version,
+          'requestedDays': int.tryParse(values['requestedDays'] ?? '') ?? 7,
+          'reason': values['reason']?.trim(),
+          if (values['freezeMode'] == 'LATER')
+            'scheduledStartAt': _asIso(values['scheduledStartAt']),
+        },
+      );
+    }
+  }
+  if (feature.path.endsWith('/cashier-shifts') &&
+      status == 'OPEN' &&
+      controller.can('finance.cash-shifts.manage')) {
+    final expectedMinor =
+        double.tryParse('${row['expectedClosingMinor'] ?? 0}') ?? 0;
+    return MobileWorkflow(
+      operationId: 'closeCashierShift:$id',
+      title: 'إغلاق وردية الصندوق',
+      description: 'سجل الرصيد النقدي الفعلي. سيحسب النظام الرصيد المتوقع والفرق ويحفظهما للمراجعة.',
+      submitLabel: 'إغلاق الوردية',
+      successMessage: 'تم إغلاق الوردية وتسجيل فرق الصندوق.',
+      method: 'POST',
+      path: '/organizations/{organizationId}/cashier-shifts/$id/closures',
+      icon: Icons.lock_outline_rounded,
+      fields: [
+        WorkflowField(
+          name: 'actualClosing',
+          label: 'الرصيد الفعلي عند الإغلاق (ر.س)',
+          type: WorkflowFieldType.number,
+          required: true,
+          allowZero: true,
+          initialValue: (expectedMinor / 100).toStringAsFixed(2),
+        ),
+        const WorkflowField(
+          name: 'reason',
+          label: 'ملاحظة الإغلاق',
+          type: WorkflowFieldType.textarea,
+          required: true,
+          initialValue: 'إغلاق الوردية بعد مطابقة النقدية',
+        ),
+      ],
+      body: (values, controller) => {
+        'branchId': row['branchId'] ?? controller.branchId,
+        'actualClosingMinor': _moneyMinor(values['actualClosing']),
+        'reason': values['reason']?.trim(),
+      },
+    );
+  }
+  if (feature.path.endsWith('/crm/leads') &&
+      !const {'CONVERTED', 'LOST', 'DISQUALIFIED'}.contains(status) &&
+      controller.can('crm.follow-ups.manage')) {
+    final next = DateTime.now().add(const Duration(days: 1));
+    return MobileWorkflow(
+      operationId: 'scheduleLeadFollowUp:$id',
+      title: 'جدولة متابعة العميل',
+      description: 'حدد الموظف وطريقة وموعد التواصل لتظهر المتابعة في جدول فريق المبيعات.',
+      submitLabel: 'حفظ موعد المتابعة',
+      successMessage: 'تمت جدولة متابعة العميل.',
+      method: 'POST',
+      path: '/organizations/{organizationId}/crm/leads/$id/follow-ups',
+      icon: Icons.calendar_month_outlined,
+      fields: [
+        const WorkflowField(
+          name: 'assignedToUserAccountId',
+          label: 'الموظف المسؤول',
+          type: WorkflowFieldType.reference,
+          required: true,
+          referencePath: '/organizations/{organizationId}/user-accounts?ownerType=EMPLOYEE&limit=500',
+          labelKeys: ['displayName', 'name'],
+          subtitleKeys: ['employeeNumber', 'email'],
+        ),
+        const WorkflowField(
+          name: 'channel',
+          label: 'طريقة التواصل',
+          type: WorkflowFieldType.select,
+          required: true,
+          initialValue: 'CALL',
+          choices: [
+            WorkflowChoice('CALL', 'مكالمة'),
+            WorkflowChoice('WHATSAPP', 'واتساب'),
+            WorkflowChoice('SMS', 'رسالة SMS'),
+            WorkflowChoice('EMAIL', 'بريد إلكتروني'),
+            WorkflowChoice('VISIT', 'زيارة'),
+            WorkflowChoice('OTHER', 'أخرى'),
+          ],
+        ),
+        WorkflowField(
+          name: 'scheduledAt',
+          label: 'موعد المتابعة',
+          type: WorkflowFieldType.dateTime,
+          required: true,
+          initialValue: _localDateTimeValue(next),
+        ),
+        const WorkflowField(
+          name: 'subject',
+          label: 'عنوان المتابعة',
+          required: true,
+          initialValue: 'متابعة العميل المحتمل',
+        ),
+        const WorkflowField(
+          name: 'notes',
+          label: 'ملاحظات التحضير',
+          type: WorkflowFieldType.textarea,
+        ),
+      ],
+      body: (values, controller) => {
+        'assignedToUserAccountId': values['assignedToUserAccountId'],
+        'channel': values['channel'],
+        'scheduledAt': _asIso(values['scheduledAt']),
+        'subject': values['subject']?.trim(),
+        if (values['notes']?.trim().isNotEmpty == true)
+          'notes': values['notes']?.trim(),
+      },
+    );
+  }
+  if (feature.path.endsWith('/crm/follow-ups') &&
+      status == 'SCHEDULED' &&
+      controller.can('crm.follow-ups.manage')) {
+    final version = int.tryParse('${row['version'] ?? 1}') ?? 1;
+    return MobileWorkflow(
+      operationId: 'completeFollowUp:$id',
+      title: 'تسجيل نتيجة المتابعة',
+      description:
+          'اختر نتيجة التواصل وأضف ملخصًا واضحًا ليستفيد منه فريق المبيعات.',
+      submitLabel: 'إكمال المتابعة',
+      successMessage: 'تم حفظ نتيجة المتابعة.',
+      method: 'POST',
+      path: '/organizations/{organizationId}/crm/follow-ups/$id/transitions',
+      icon: Icons.task_alt_rounded,
+      fields: const [
+        WorkflowField(
+          name: 'outcome',
+          label: 'نتيجة التواصل',
+          type: WorkflowFieldType.select,
+          required: true,
+          initialValue: 'INTERESTED',
+          choices: [
+            WorkflowChoice('INTERESTED', 'مهتم'),
+            WorkflowChoice('CALLBACK', 'طلب معاودة الاتصال'),
+            WorkflowChoice('NOT_INTERESTED', 'غير مهتم'),
+            WorkflowChoice('NO_ANSWER', 'لا يوجد رد'),
+            WorkflowChoice('TRIAL_BOOKED', 'حجز تجربة'),
+            WorkflowChoice('MEMBERSHIP_SOLD', 'تم بيع عضوية'),
+            WorkflowChoice('OTHER', 'نتيجة أخرى'),
+          ],
+        ),
+        WorkflowField(
+          name: 'notes',
+          label: 'ملخص المتابعة',
+          type: WorkflowFieldType.textarea,
+        ),
+      ],
+      body: (values, controller) => {
+        'status': 'COMPLETED',
+        'outcome': values['outcome'],
+        if (values['notes']?.trim().isNotEmpty == true)
+          'notes': values['notes']?.trim(),
+        'expectedVersion': version,
+      },
+    );
+  }
+  if (feature.path.contains('/daily-menus/') &&
+      status != 'CLOSED' &&
+      controller.can('restaurant.menu.manage')) {
+    final version = int.tryParse('${row['version'] ?? 1}') ?? 1;
+    final enabledItems = row['items'] is List
+        ? (row['items'] as List)
+              .whereType<Map>()
+              .where((item) => item['enabled'] != false)
+              .toList()
+        : const <Map>[];
+    return MobileWorkflow(
+      operationId: 'reviseDailyMenu:$id',
+      title: 'تحديث قائمة اليوم',
+      description: 'اختر الوجبات التي ستظل ظاهرة للأعضاء. يحتفظ النظام بإصدار القائمة وسجل تعديلها.',
+      submitLabel: 'حفظ تحديث القائمة',
+      successMessage: 'تم تحديث قائمة اليوم.',
+      method: 'PUT',
+      path: '/organizations/{organizationId}/branches/{branchId}/daily-menus/{businessDate}',
+      icon: Icons.edit_calendar_outlined,
+      fields: [
+        WorkflowField(
+          name: 'mealIds',
+          label: 'الوجبات الظاهرة',
+          type: WorkflowFieldType.multiReference,
+          required: true,
+          initialValue: _initialIds(enabledItems),
+          referencePath: '/organizations/{organizationId}/restaurant/meals',
+          labelKeys: ['name', 'mealName'],
+          subtitleKeys: ['categoryName', 'code'],
+        ),
+      ],
+      body: (values, controller) => {
+        'expectedVersion': version,
+        'items': _selectedValues(values['mealIds'])
+            .map((id) => {'mealId': id, 'enabled': true})
+            .toList(),
+      },
+    );
+  }
+  if (feature.path.endsWith('/payments') &&
+      controller.can('finance.refunds.issue')) {
+    final amountMinor = double.tryParse('${row['amountMinor'] ?? 0}') ?? 0;
+    final refundedMinor = double.tryParse('${row['refundedMinor'] ?? 0}') ?? 0;
+    final refundableMinor = max(0.0, amountMinor - refundedMinor);
+    final method =
+        row['paymentMethodCode']?.toString() ?? row['method']?.toString() ?? '';
+    if (refundableMinor > 0 && status != 'REFUNDED') {
+      return MobileWorkflow(
+        operationId: 'refundPayment:$id',
+        title: 'استرجاع دفعة',
+        description:
+            'أدخل المبلغ المطلوب استرجاعه. المتاح حاليًا ${(refundableMinor / 100).toStringAsFixed(2)} ر.س.',
+        submitLabel: 'تنفيذ الاسترجاع',
+        successMessage: 'تم تسجيل استرجاع الدفعة.',
+        method: 'POST',
+        path: '/organizations/{organizationId}/payments/$id/refunds',
+        icon: Icons.currency_exchange_rounded,
+        fields: [
+          WorkflowField(
+            name: 'amount',
+            label: 'مبلغ الاسترجاع (ر.س)',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: (refundableMinor / 100).toStringAsFixed(2),
+          ),
+          const WorkflowField(
+            name: 'reason',
+            label: 'سبب الاسترجاع',
+            type: WorkflowFieldType.textarea,
+            required: true,
+          ),
+          if (method == 'CASH')
+            const WorkflowField(
+              name: 'cashierShiftId',
+              label: 'وردية الصندوق المفتوحة',
+              type: WorkflowFieldType.reference,
+              required: true,
+              referencePath: '/organizations/{organizationId}/cashier-shifts?status=OPEN&limit=100',
+              labelKeys: ['cashPointName', 'cashierName'],
+              subtitleKeys: ['openedAt'],
+            ),
+        ],
+        body: (values, controller) => {
+          'amountMinor': _moneyMinor(values['amount']),
+          'reason': values['reason']?.trim(),
+          if (method == 'CASH') 'cashierShiftId': values['cashierShiftId'],
+        },
+      );
+    }
+  }
+  if (feature.path.endsWith('/refund-requests') &&
+      status == 'APPROVED' &&
+      controller.can('finance.refunds.issue')) {
+    final version = int.tryParse('${row['version'] ?? 0}') ?? 0;
+    final payments =
+        (row['payments'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    final hasCash = payments.any(
+      (payment) => payment['method']?.toString() == 'CASH',
+    );
+    return MobileWorkflow(
+      operationId: 'fulfillRefundRequest:$id',
+      title: 'تنفيذ طلب الاسترداد',
+      description: 'سيُوزع المبلغ المعتمد تلقائيًا على الدفعات الأصلية ويصدر إشعار دائن مرتبط بالفاتورة.',
+      submitLabel: 'تنفيذ الاسترداد',
+      successMessage: 'تم تنفيذ الاسترداد وإصدار الإشعار الدائن.',
+      method: 'POST',
+      path: '/organizations/{organizationId}/refund-requests/$id/fulfillments',
+      icon: Icons.assignment_return_outlined,
+      fields: [
+        if (hasCash)
+          const WorkflowField(
+            name: 'cashierShiftId',
+            label: 'وردية الصندوق المفتوحة للاسترجاع النقدي',
+            type: WorkflowFieldType.reference,
+            required: true,
+            referencePath: '/organizations/{organizationId}/cashier-shifts?status=OPEN&limit=100',
+            labelKeys: ['cashPointName', 'cashierName'],
+            subtitleKeys: ['openedAt'],
+          ),
+      ],
+      body: (values, controller) {
+        var remaining =
+            int.tryParse('${row['requestedAmountMinor'] ?? 0}') ?? 0;
+        final allocations = <Map<String, dynamic>>[];
+        for (final payment in payments) {
+          if (remaining <= 0) break;
+          final capacity =
+              int.tryParse('${payment['refundableMinor'] ?? 0}') ?? 0;
+          final amount = min(capacity, remaining);
+          if (amount <= 0) continue;
+          allocations.add({
+            'paymentId': payment['id']?.toString(),
+            'amountMinor': '$amount',
+            if (payment['method']?.toString() == 'CASH')
+              'cashierShiftId': values['cashierShiftId'],
+          });
+          remaining -= amount;
+        }
+        return {'expectedVersion': version, 'allocations': allocations};
+      },
+    );
+  }
+  if (feature.path.endsWith('/lockers') &&
+      status == 'AVAILABLE' &&
+      controller.can('lockers.manage')) {
+    return MobileWorkflow(
+      operationId: 'assignLocker:$id',
+      title: 'تخصيص الخزانة لعضو',
+      description: 'اختر العضو ومدة الاستخدام والعربون. ستتحول الخزانة تلقائيًا إلى مستخدمة.',
+      submitLabel: 'تخصيص الخزانة',
+      successMessage: 'تم تخصيص الخزانة للعضو.',
+      method: 'POST',
+      path: '/organizations/{organizationId}/locker-assignments',
+      icon: Icons.how_to_reg_outlined,
+      fields: [
+        const WorkflowField(
+          name: 'memberId',
+          label: 'العضو',
+          type: WorkflowFieldType.reference,
+          required: true,
+          referencePath: '/organizations/{organizationId}/members',
+          labelKeys: ['name', 'fullNameAr'],
+          subtitleKeys: ['memberNumber'],
+        ),
+        WorkflowField(
+          name: 'startsAt',
+          label: 'بداية الاستخدام',
+          type: WorkflowFieldType.dateTime,
+          required: true,
+        ),
+        const WorkflowField(
+          name: 'endsAt',
+          label: 'نهاية الاستخدام (اختياري)',
+          type: WorkflowFieldType.dateTime,
+          autoFillDate: false,
+        ),
+        const WorkflowField(
+          name: 'deposit',
+          label: 'العربون (ر.س)',
+          type: WorkflowFieldType.number,
+          required: true,
+          initialValue: '0',
+          allowZero: true,
+        ),
+      ],
+      body: (values, controller) => {
+        'branchId': row['branchId'] ?? controller.branchId,
+        'lockerId': id,
+        'memberId': values['memberId'],
+        'startsAt': _asIso(values['startsAt']),
+        if (values['endsAt']?.isNotEmpty == true)
+          'endsAt': _asIso(values['endsAt']),
+        'depositMinor': _moneyMinor(values['deposit']),
+      },
+    );
+  }
+  return null;
 }
 
 typedef _RecordActionBody = Map<String, dynamic> Function(
@@ -7325,6 +11706,29 @@ class _RecordAction {
 String _rowId(Map<String, dynamic> row, List<String> keys) => keys
     .map((key) => row[key]?.toString() ?? '')
     .firstWhere((value) => value.isNotEmpty, orElse: () => '');
+
+bool _selfRenewalAllowed(Map<String, dynamic> row) {
+  if (row['cancellationRequest'] != null) return false;
+  final schedules = row['freezeSchedules'];
+  if (schedules is List &&
+      schedules.whereType<Map>().any(
+        (schedule) => schedule['status']?.toString() == 'PENDING',
+      )) {
+    return false;
+  }
+  final snapshot = row['policySnapshot'];
+  if (snapshot is! Map || snapshot['policies'] is! List) return false;
+  final renewal = (snapshot['policies'] as List)
+      .whereType<Map>()
+      .where((policy) => policy['policyType']?.toString() == 'RENEWAL')
+      .firstOrNull;
+  final configuration = renewal?['configuration'];
+  if (configuration is! Map) return false;
+  final graceDays = int.tryParse('${configuration['graceDays'] ?? ''}');
+  final termEnd = DateTime.tryParse(row['termEnd']?.toString() ?? '');
+  if (graceDays == null || graceDays < 0 || termEnd == null) return false;
+  return !DateTime.now().isAfter(termEnd.add(Duration(days: graceDays)));
+}
 
 List<_RecordAction> _recordActions(
   GoController controller,
@@ -7391,22 +11795,6 @@ List<_RecordAction> _recordActions(
     final id = _rowId(row, ['id', 'subscriptionId']);
     final base =
         '/self/organizations/$organization/members/${controller.selectedMemberId}/subscriptions/$id';
-    if (id.isNotEmpty && status == 'ACTIVE') {
-      add(
-        _RecordAction(
-          label: 'طلب تجميد الاشتراك',
-          icon: Icons.pause_circle_outline,
-          path: '$base/freezes',
-          requiresReason: true,
-          requiresDays: true,
-          body: (reason, days) => {
-            'expectedVersion': version,
-            'requestedDays': days,
-            'reason': reason,
-          },
-        ),
-      );
-    }
     if (id.isNotEmpty && status == 'FROZEN') {
       add(
         _RecordAction(
@@ -7426,6 +11814,31 @@ List<_RecordAction> _recordActions(
           requiresReason: true,
           destructive: true,
           body: (reason, _) => {'expectedVersion': version, 'reason': reason},
+        ),
+      );
+    }
+    final packageId = row['packageId']?.toString() ?? '';
+    if (id.isNotEmpty && packageId.isNotEmpty && _selfRenewalAllowed(row)) {
+      add(
+        _RecordAction(
+          label: 'تجديد الاشتراك',
+          icon: Icons.autorenew_rounded,
+          path:
+              '/self/organizations/$organization/members/${controller.selectedMemberId}/orders',
+          body: (_, _) => {
+            'sellingBranchId':
+                row['sellingBranchId'] ??
+                row['registrationBranchId'] ??
+                controller.branchId,
+            'lines': [
+              {
+                'type': 'MEMBERSHIP',
+                'targetId': packageId,
+                'quantity': 1,
+                'renewal': {'subscriptionId': id, 'expectedVersion': version},
+              },
+            ],
+          },
         ),
       );
     }
@@ -7542,7 +11955,7 @@ List<_RecordAction> _recordActions(
     final id = _rowId(row, ['id', 'expenseId']);
     if (id.isEmpty) return actions;
     final transitions = switch (status) {
-      'DRAFT' => const [('SUBMIT', 'إرسال للاعتماد')],
+      'DRAFT' || 'RECORDED' => const [('SUBMIT', 'إرسال للاعتماد')],
       'SUBMITTED' => const [
         ('APPROVE', 'اعتماد المصروف'),
         ('VOID', 'رفض وإلغاء'),
@@ -7605,6 +12018,348 @@ List<_RecordAction> _recordActions(
       }
     }
   }
+
+  if (path.endsWith('/refund-requests') && status == 'REQUESTED') {
+    final id = _rowId(row, ['id', 'requestId']);
+    for (final review in const [
+      ('APPROVE', 'اعتماد طلب الاسترداد'),
+      ('REJECT', 'رفض طلب الاسترداد'),
+    ]) {
+      if (id.isEmpty) continue;
+      add(
+        _RecordAction(
+          label: review.$2,
+          icon: review.$1 == 'APPROVE'
+              ? Icons.verified_outlined
+              : Icons.cancel_outlined,
+          path: '/organizations/$organization/refund-requests/$id/reviews',
+          permission: 'finance.refunds.approve',
+          requiresReason: true,
+          destructive: review.$1 == 'REJECT',
+          body: (reason, _) => {
+            'expectedVersion': version,
+            'decision': review.$1,
+            'reason': reason,
+          },
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/packages')) {
+    final id = _rowId(row, ['id', 'packageId']);
+    if (id.isNotEmpty && status == 'DRAFT') {
+      add(
+        _RecordAction(
+          label: 'نشر الباقة للبيع',
+          icon: Icons.publish_rounded,
+          path: '/organizations/$organization/packages/$id/publications',
+          permission: 'commercial.manage',
+          body: (_, _) => {'expectedVersion': version},
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/communication-campaigns')) {
+    final id = _rowId(row, ['id', 'campaignId']);
+    if (id.isNotEmpty && status == 'SCHEDULED') {
+      add(
+        _RecordAction(
+          label: 'إلغاء جدولة الرسالة',
+          icon: Icons.event_busy_outlined,
+          path:
+              '/organizations/$organization/communication-campaigns/$id/cancellations',
+          permission: 'notifications.send',
+          destructive: true,
+          body: (_, _) => {
+            if (row['branchId'] != null) 'branchId': row['branchId'],
+            'expectedVersion': version,
+          },
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/role-assignments')) {
+    final id = _rowId(row, ['id', 'assignmentId']);
+    if (id.isNotEmpty && row['revokedAt'] == null && status != 'REVOKED') {
+      add(
+        _RecordAction(
+          label: 'إلغاء مجموعة الصلاحيات',
+          icon: Icons.person_remove_alt_1_outlined,
+          path: '/organizations/$organization/role-assignments/$id/revocations',
+          permission: 'iam.assignments.manage',
+          requiresReason: true,
+          destructive: true,
+          body: (reason, _) => {'expectedVersion': version, 'reason': reason},
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/access-credentials')) {
+    final id = _rowId(row, ['id', 'credentialId']);
+    if (id.isNotEmpty && status == 'ACTIVE') {
+      add(
+        _RecordAction(
+          label: 'إلغاء وسيلة الدخول',
+          icon: Icons.key_off_outlined,
+          path:
+              '/organizations/$organization/access-credentials/$id/revocations',
+          permission: 'access-credentials.manage',
+          requiresReason: true,
+          destructive: true,
+          body: (reason, _) => {'reason': reason},
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/other-income')) {
+    final id = _rowId(row, ['id', 'incomeId']);
+    if (id.isNotEmpty && !const {'VOID', 'VOIDED'}.contains(status)) {
+      add(
+        _RecordAction(
+          label: 'إلغاء قيد الإيراد',
+          icon: Icons.money_off_csred_outlined,
+          path: '/organizations/$organization/other-income/$id/voids',
+          permission: 'finance.other-income.manage',
+          requiresReason: true,
+          destructive: true,
+          body: (reason, _) => {
+            'branchId': row['branchId'] ?? controller.branchId,
+            'reason': reason,
+            'expectedVersion': version,
+          },
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/trainer-commissions')) {
+    final id = _rowId(row, ['id', 'commissionId']);
+    final nextStatuses = switch (status) {
+      'ACCRUED' => const [
+        ('APPROVED', 'اعتماد العمولة'),
+        ('VOIDED', 'إلغاء العمولة'),
+      ],
+      'APPROVED' => const [
+        ('PAID', 'تسجيل صرف العمولة'),
+        ('VOIDED', 'إلغاء العمولة'),
+      ],
+      _ => const <(String, String)>[],
+    };
+    for (final transition in nextStatuses) {
+      add(
+        _RecordAction(
+          label: transition.$2,
+          icon: transition.$1 == 'PAID'
+              ? Icons.paid_outlined
+              : transition.$1 == 'APPROVED'
+              ? Icons.verified_outlined
+              : Icons.cancel_outlined,
+          path:
+              '/organizations/$organization/trainer-commissions/$id/transitions',
+          permission: 'coaching.commissions.manage',
+          destructive: transition.$1 == 'VOIDED',
+          body: (_, _) => {
+            'branchId': row['branchId'] ?? controller.branchId,
+            'expectedStatus': status,
+            'status': transition.$1,
+          },
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/lockers')) {
+    final id = _rowId(row, ['id', 'lockerId']);
+    for (final transition in const [
+      ('AVAILABLE', 'إتاحة الخزانة'),
+      ('MAINTENANCE', 'تحويل للصيانة'),
+      ('INACTIVE', 'إيقاف الخزانة'),
+    ]) {
+      if (id.isEmpty || status == transition.$1) continue;
+      add(
+        _RecordAction(
+          label: transition.$2,
+          icon: transition.$1 == 'AVAILABLE'
+              ? Icons.lock_open_outlined
+              : transition.$1 == 'MAINTENANCE'
+              ? Icons.build_outlined
+              : Icons.block_outlined,
+          path: '/organizations/$organization/lockers/$id/transitions',
+          permission: 'lockers.manage',
+          destructive: transition.$1 == 'INACTIVE',
+          body: (_, _) => {
+            'branchId': row['branchId'] ?? controller.branchId,
+            'status': transition.$1,
+            'expectedVersion': version,
+          },
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/crm/follow-ups')) {
+    final id = _rowId(row, ['id', 'followUpId']);
+    if (id.isNotEmpty && status == 'SCHEDULED') {
+      for (final transition in const [
+        ('MISSED', 'تسجيل عدم الرد'),
+        ('CANCELLED', 'إلغاء المتابعة'),
+      ]) {
+        add(
+          _RecordAction(
+            label: transition.$2,
+            icon: transition.$1 == 'MISSED'
+                ? Icons.phone_missed_outlined
+                : Icons.event_busy_outlined,
+            path: '/organizations/$organization/crm/follow-ups/$id/transitions',
+            permission: 'crm.follow-ups.manage',
+            destructive: transition.$1 == 'CANCELLED',
+            body: (_, _) => {
+              'status': transition.$1,
+              'expectedVersion': version,
+            },
+          ),
+        );
+      }
+    }
+  }
+
+  if (path.endsWith('/employee-shifts')) {
+    final id = _rowId(row, ['id', 'shiftId']);
+    final nextStatuses = switch (status) {
+      'SCHEDULED' => const [
+        ('IN_PROGRESS', 'بدء المناوبة'),
+        ('CANCELLED', 'إلغاء المناوبة'),
+      ],
+      'IN_PROGRESS' => const [
+        ('COMPLETED', 'إنهاء المناوبة'),
+        ('CANCELLED', 'إلغاء المناوبة'),
+      ],
+      _ => const <(String, String)>[],
+    };
+    for (final transition in nextStatuses) {
+      if (id.isEmpty) continue;
+      add(
+        _RecordAction(
+          label: transition.$2,
+          icon: transition.$1 == 'IN_PROGRESS'
+              ? Icons.play_circle_outline
+              : transition.$1 == 'COMPLETED'
+              ? Icons.task_alt_outlined
+              : Icons.event_busy_outlined,
+          path: '/organizations/$organization/employee-shifts/$id/transitions',
+          permission: 'workforce.shifts.manage',
+          destructive: transition.$1 == 'CANCELLED',
+          body: (_, _) => {
+            'branchId': row['branchId'] ?? controller.branchId,
+            'status': transition.$1,
+            'expectedVersion': version,
+          },
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/whatsapp-campaigns')) {
+    final id = _rowId(row, ['id', 'campaignId']);
+    if (id.isNotEmpty && status == 'DRAFT') {
+      add(
+        _RecordAction(
+          label: 'وضع الحملة في طابور الإرسال',
+          icon: Icons.outbox_outlined,
+          path: '/organizations/$organization/whatsapp-campaigns/$id/queue',
+          permission: 'notifications.whatsapp.manage',
+          body: (_, _) => {
+            if (row['branchId'] != null) 'branchId': row['branchId'],
+            'expectedVersion': version,
+          },
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/member-training-plans')) {
+    final id = _rowId(row, ['id', 'planId']);
+    final nextStatuses = switch (status) {
+      'DRAFT' => const [
+        ('ACTIVE', 'تفعيل الخطة'),
+        ('CANCELLED', 'إلغاء الخطة'),
+      ],
+      'ACTIVE' => const [
+        ('COMPLETED', 'إكمال الخطة'),
+        ('CANCELLED', 'إلغاء الخطة'),
+      ],
+      _ => const <(String, String)>[],
+    };
+    for (final transition in nextStatuses) {
+      if (id.isEmpty) continue;
+      add(
+        _RecordAction(
+          label: transition.$2,
+          icon: transition.$1 == 'ACTIVE'
+              ? Icons.play_circle_outline
+              : transition.$1 == 'COMPLETED'
+              ? Icons.task_alt_outlined
+              : Icons.cancel_outlined,
+          path:
+              '/organizations/$organization/member-training-plans/$id/transitions',
+          permission: 'coaching.training-plans.manage',
+          destructive: transition.$1 == 'CANCELLED',
+          body: (_, _) => {'status': transition.$1, 'expectedVersion': version},
+        ),
+      );
+    }
+  }
+
+  if (path.contains('/daily-menus/')) {
+    final businessDate = row['businessDate']?.toString().isNotEmpty == true
+        ? row['businessDate'].toString()
+        : riyadhBusinessDate();
+    final action = switch (status) {
+      'DRAFT' => ('publications', 'نشر القائمة للأعضاء'),
+      'PUBLISHED' => ('closures', 'إغلاق قائمة اليوم'),
+      _ => null,
+    };
+    if (action != null) {
+      add(
+        _RecordAction(
+          label: action.$2,
+          icon: status == 'DRAFT'
+              ? Icons.publish_outlined
+              : Icons.visibility_off_outlined,
+          path:
+              '/organizations/$organization/branches/${controller.branchId}/daily-menus/$businessDate/${action.$1}',
+          permission: 'restaurant.menu.manage',
+          destructive: status == 'PUBLISHED',
+          body: (_, _) => {'expectedVersion': version},
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/lockers')) {
+    final assignmentId = _rowId(row, ['assignmentId']);
+    if (assignmentId.isNotEmpty && status == 'ASSIGNED') {
+      add(
+        _RecordAction(
+          label: 'إنهاء تخصيص الخزانة',
+          icon: Icons.person_remove_outlined,
+          path:
+              '/organizations/$organization/locker-assignments/$assignmentId/releases',
+          permission: 'lockers.manage',
+          requiresReason: true,
+          body: (reason, _) => {
+            'branchId': row['branchId'] ?? controller.branchId,
+            'reason': reason,
+          },
+        ),
+      );
+    }
+  }
   return actions;
 }
 
@@ -7648,15 +12403,84 @@ class _RecordActionsPageState extends State<RecordActionsPage> {
       setState(() => error = 'أدخل عدد أيام صحيحًا.');
       return;
     }
+    Map<String, dynamic>? cancellationPreview;
+    Map<String, dynamic>? renewalQuote;
+    if (action.label == 'تجديد الاشتراك') {
+      setState(() {
+        saving = true;
+        error = null;
+      });
+      try {
+        final data = await widget.controller.api.request(
+          '/self/organizations/${widget.controller.organizationId}/quotes',
+          method: 'POST',
+          body: {
+            'branchId':
+                widget.row['sellingBranchId'] ??
+                widget.row['registrationBranchId'] ??
+                widget.controller.branchId,
+            'targetType': 'PACKAGE',
+            'targetId': widget.row['packageId'],
+            'quantity': 1,
+            'memberId': widget.controller.selectedMemberId,
+          },
+        );
+        renewalQuote = data is Map
+            ? Map<String, dynamic>.from(data)
+            : <String, dynamic>{};
+      } catch (exception) {
+        setState(() => error = _errorMessage(exception));
+        return;
+      } finally {
+        if (mounted) setState(() => saving = false);
+      }
+    }
+    if (action.path.startsWith('/self/') &&
+        action.path.contains('/subscriptions/') &&
+        action.path.endsWith('/cancellations')) {
+      setState(() {
+        saving = true;
+        error = null;
+      });
+      try {
+        final data = await widget.controller.api.request(
+          action.path.replaceFirst(
+            RegExp(r'/cancellations$'),
+            '/cancellation-preview',
+          ),
+        );
+        cancellationPreview = data is Map
+            ? Map<String, dynamic>.from(data)
+            : <String, dynamic>{};
+        if (cancellationPreview['allowed'] == false) {
+          setState(
+            () => error =
+                cancellationPreview?['blockingReason']?.toString() ??
+                'إلغاء الاشتراك غير متاح وفق سياسة الباقة.',
+          );
+          return;
+        }
+      } catch (exception) {
+        setState(() => error = _errorMessage(exception));
+        return;
+      } finally {
+        if (mounted) setState(() => saving = false);
+      }
+    }
+    if (!mounted) return;
     final accepted = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text(action.label),
-        content: Text(
-          action.destructive
-              ? 'هذا الإجراء يغيّر حالة السجل وقد يؤثر في العمليات المرتبطة. هل تريد المتابعة؟'
-              : 'سيتم تنفيذ الإجراء على بيانات الإنتاج. هل تريد المتابعة؟',
-        ),
+        content: cancellationPreview != null
+            ? _SubscriptionCancellationPreview(preview: cancellationPreview)
+            : renewalQuote != null
+            ? _RenewalQuotePreview(quote: renewalQuote, row: widget.row)
+            : Text(
+                action.destructive
+                    ? 'هذا الإجراء يغيّر حالة السجل وقد يؤثر في العمليات المرتبطة. هل تريد المتابعة؟'
+                    : 'سيتم تنفيذ الإجراء على بيانات الإنتاج. هل تريد المتابعة؟',
+              ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -7772,6 +12596,126 @@ class _RecordActionsPageState extends State<RecordActionsPage> {
   }
 }
 
+class _SubscriptionCancellationPreview extends StatelessWidget {
+  const _SubscriptionCancellationPreview({required this.preview});
+  final Map<String, dynamic> preview;
+
+  @override
+  Widget build(BuildContext context) {
+    final immediate = preview['mode'] == 'IMMEDIATE_PRORATED';
+    final calculation = preview['calculation'] is Map
+        ? Map<String, dynamic>.from(preview['calculation'] as Map)
+        : <String, dynamic>{};
+    return SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            immediate
+                ? 'سيتوقف الاشتراك فورًا، ويُرسل الاسترداد المتوقع إلى الإدارة المالية للاعتماد.'
+                : 'سيظل الاشتراك متاحًا حتى ${_displayValue('effectiveAt', preview['effectiveAt'])} ثم يُلغى تلقائيًا.',
+            style: const TextStyle(height: 1.55),
+          ),
+          if (immediate) ...[
+            const SizedBox(height: 14),
+            _previewLine(
+              'المتبقي قبل الرسوم',
+              calculation['proratedGrossMinor'],
+            ),
+            _previewLine('رسوم الإلغاء', calculation['feeMinor']),
+            _previewLine(
+              'الاسترداد المتوقع',
+              calculation['eligibleRefundMinor'],
+              emphasized: true,
+            ),
+            _previewLine(
+              'الضريبة ضمن الاسترداد',
+              calculation['estimatedTaxMinor'],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _previewLine(
+    String label,
+    dynamic amount, {
+    bool emphasized = false,
+  }) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 4),
+    child: Row(
+      children: [
+        Expanded(child: Text(label, style: const TextStyle(fontSize: 12))),
+        Text(
+          _money(amount ?? 0),
+          style: TextStyle(
+            fontWeight: FontWeight.w900,
+            color: emphasized ? Colors.green[700] : null,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class _RenewalQuotePreview extends StatelessWidget {
+  const _RenewalQuotePreview({required this.quote, required this.row});
+  final Map<String, dynamic> quote;
+  final Map<String, dynamic> row;
+
+  @override
+  Widget build(BuildContext context) => SingleChildScrollView(
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          quote['targetName']?.toString() ??
+              row['packageName']?.toString() ??
+              'تجديد الاشتراك',
+          style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'سيُنشأ طلب وفاتورة مستقلة بالسعر والسياسات الحالية، ويبدأ التجديد بعد نهاية المدة الحالية دون فقد الأيام المتبقية.',
+          style: TextStyle(height: 1.55, fontSize: 12),
+        ),
+        const SizedBox(height: 14),
+        _line('السعر قبل الخصم', quote['baseAmountMinor']),
+        if ((num.tryParse('${quote['discountMinor'] ?? 0}') ?? 0) > 0)
+          _line('الخصم', quote['discountMinor']),
+        _line('الصافي قبل الضريبة', quote['netMinor']),
+        _line('الضريبة', quote['taxMinor']),
+        const Divider(),
+        _line('الإجمالي المطلوب', quote['grossMinor'], emphasized: true),
+        _line('موعد البداية', row['termEnd'], date: true),
+      ],
+    ),
+  );
+
+  Widget _line(
+    String label,
+    dynamic value, {
+    bool emphasized = false,
+    bool date = false,
+  }) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 4),
+    child: Row(
+      children: [
+        Expanded(child: Text(label, style: const TextStyle(fontSize: 12))),
+        Text(
+          date ? _displayValue('termEnd', value) : _money(value ?? 0),
+          style: TextStyle(
+            fontWeight: emphasized ? FontWeight.w900 : FontWeight.w700,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
 class _ResourceMessage extends StatelessWidget {
   const _ResourceMessage({
     required this.icon,
@@ -7823,15 +12767,34 @@ String _displayValue(String key, dynamic value) {
   if (value == null) return '';
   if (key.endsWith('Minor')) return _money(value);
   if (key.endsWith('At')) return _relativeTime(value.toString());
+  if (key.endsWith('On') ||
+      key == 'termStart' ||
+      key == 'termEnd' ||
+      key == 'businessDate' ||
+      key == 'birthDate') {
+    final raw = value.toString();
+    if (raw.length >= 10) {
+      return raw.substring(0, 10).split('-').reversed.join('/');
+    }
+  }
   final text = value.toString();
   return const {
         'ACTIVE': 'نشط',
+        'ACTIVE_PROVISIONAL': 'نشط مؤقتًا',
         'INACTIVE': 'غير نشط',
         'PENDING': 'قيد الانتظار',
         'APPROVED': 'مقبول',
         'REJECTED': 'مرفوض',
         'CANCELLED': 'ملغي',
+        'FROZEN': 'مجمّد',
+        'EXPIRED': 'منتهي',
         'PAID': 'مدفوع',
+        'PARTIALLY_PAID': 'مدفوع جزئيًا',
+        'FULFILLED': 'مكتمل',
+        'COMPLETED': 'مكتمل',
+        'SCHEDULED': 'مجدول',
+        'IN_PROGRESS': 'جارٍ التنفيذ',
+        'SKIPPED': 'تم التخطي',
         'OPEN': 'مفتوح',
         'CLOSED': 'مغلق',
       }[text] ??
@@ -8011,6 +12974,7 @@ class MorePage extends StatelessWidget {
       '/restaurant/meal-categories',
       '/restaurant/meals',
       '/restaurant/meal-prices',
+      '/daily-menus/{businessDate}',
     ];
     const trainer = [
       '/trainers',
@@ -8088,13 +13052,8 @@ class MorePage extends StatelessWidget {
           title: 'نقطة البيع',
           subtitle: 'الطلبات والفواتير والتحصيل ووردية الصندوق',
           icon: Icons.point_of_sale_outlined,
-          onTap: () => _hub(
-            context,
-            title: 'نقطة البيع',
-            subtitle: 'مسار البيع والتحصيل كاملًا داخل الفرع الحالي.',
-            icon: Icons.point_of_sale_outlined,
-            endings: pos,
-          ),
+          onTap: () =>
+              _push(context, PointOfSaleMobilePage(controller: controller)),
         ),
       if (_canAny(finance))
         _MobileNavItem(
@@ -8232,24 +13191,44 @@ class MorePage extends StatelessWidget {
         children: [
           Card(
             margin: const EdgeInsets.only(bottom: 14),
-            child: ListTile(
-              contentPadding: const EdgeInsets.all(14),
-              leading: const CircleAvatar(
-                radius: 25,
-                backgroundColor: goYellow,
-                child: Icon(Icons.person, color: goInk),
-              ),
-              title: Text(
-                controller.displayName,
-                style: const TextStyle(fontWeight: FontWeight.w900),
-              ),
-              subtitle: Text('${controller.branchName} • حساب موظف'),
-              trailing: IconButton(
-                onPressed: () =>
-                    _push(context, AccountPage(controller: controller)),
-                icon: const Icon(Icons.manage_accounts_outlined),
-                tooltip: 'إعدادات حسابي',
-              ),
+            child: Column(
+              children: [
+                ListTile(
+                  contentPadding: const EdgeInsets.all(14),
+                  leading: const CircleAvatar(
+                    radius: 25,
+                    backgroundColor: goYellow,
+                    child: Icon(Icons.person, color: goInk),
+                  ),
+                  title: Text(
+                    controller.displayName,
+                    style: const TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                  subtitle: Text('${controller.branchName} • حساب موظف'),
+                  trailing: IconButton(
+                    onPressed: () =>
+                        _push(context, AccountPage(controller: controller)),
+                    icon: const Icon(Icons.manage_accounts_outlined),
+                    tooltip: 'إعدادات حسابي',
+                  ),
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  onTap: () => _push(
+                    context,
+                    EmployeeSelfSpacePage(controller: controller),
+                  ),
+                  leading: const Icon(Icons.schedule_rounded),
+                  title: const Text(
+                    'مساحة عملي',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: const Text(
+                    'مناوباتي وحضوري ومساحة المدرب عند توفرها',
+                  ),
+                  trailing: const Icon(Icons.chevron_left_rounded),
+                ),
+              ],
             ),
           ),
           _MobileNavSection(
@@ -8274,30 +13253,7 @@ class MorePage extends StatelessWidget {
           Card(
             child: Column(
               children: [
-                ListTile(
-                  onTap: () =>
-                      _push(context, WorkflowHubPage(controller: controller)),
-                  leading: const Icon(Icons.bolt_rounded),
-                  title: const Text(
-                    'الإجراءات الأساسية',
-                    style: TextStyle(fontWeight: FontWeight.w800),
-                  ),
-                  subtitle: const Text('إنشاء وتحصيل وحجز من نماذج الموبايل'),
-                  trailing: const Icon(Icons.chevron_left_rounded),
-                ),
-                const Divider(height: 1),
-                ListTile(
-                  onTap: () =>
-                      _push(context, ApiOperationsPage(controller: controller)),
-                  leading: const Icon(Icons.hub_outlined),
-                  title: const Text('العمليات المتقدمة'),
-                  subtitle: const Text(
-                    'كل عمليات API الموثقة للحالات المتخصصة',
-                  ),
-                  trailing: const Icon(Icons.chevron_left_rounded),
-                ),
                 if (controller.branches.isNotEmpty) ...[
-                  const Divider(height: 1),
                   ListTile(
                     onTap: () => _openContextSheet(context, controller),
                     leading: const Icon(Icons.location_on_outlined),
@@ -8313,6 +13269,1148 @@ class MorePage extends StatelessWidget {
       ),
     );
   }
+}
+
+List<Map<String, dynamic>> _portalRows(dynamic data) {
+  final values = data is List
+      ? data
+      : data is Map && data['items'] is List
+      ? data['items'] as List
+      : const <dynamic>[];
+  return values
+      .whereType<Map>()
+      .map((row) => Map<String, dynamic>.from(row))
+      .toList();
+}
+
+class EmployeeSelfSpacePage extends StatefulWidget {
+  const EmployeeSelfSpacePage({super.key, required this.controller});
+  final GoController controller;
+
+  @override
+  State<EmployeeSelfSpacePage> createState() => _EmployeeSelfSpacePageState();
+}
+
+class _EmployeeSelfSpacePageState extends State<EmployeeSelfSpacePage> {
+  Map<String, dynamic>? employee;
+  List<Map<String, dynamic>> shifts = [];
+  List<Map<String, dynamic>> attendance = [];
+  bool loading = true;
+  bool recording = false;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(load());
+  }
+
+  Map<String, String> get _range {
+    final now = DateTime.now().toUtc();
+    return {
+      'from': now.subtract(const Duration(days: 30)).toIso8601String(),
+      'to': now.add(const Duration(days: 30)).toIso8601String(),
+    };
+  }
+
+  Future<void> load() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      final base =
+          '/self/organizations/${widget.controller.organizationId}/employee';
+      final profile = await widget.controller.api.request(base);
+      employee = profile is Map
+          ? Map<String, dynamic>.from(profile)
+          : <String, dynamic>{};
+      final values = await Future.wait([
+        widget.controller.api.request('$base/shifts', query: _range),
+        widget.controller.api.request('$base/attendance', query: _range),
+      ]);
+      shifts = _portalRows(values[0]);
+      attendance = _portalRows(values[1]);
+    } catch (exception) {
+      employee = null;
+      shifts = [];
+      attendance = [];
+      error = exception is ApiFailure && exception.isNotFound
+          ? 'لا يوجد ملف موظف مرتبط بحساب الدخول الحالي.'
+          : _errorMessage(exception);
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  Future<void> recordAttendance() async {
+    final lastEvent = attendance.firstOrNull?['eventType']?.toString();
+    final nextEvent = lastEvent == 'CLOCK_IN' ? 'CLOCK_OUT' : 'CLOCK_IN';
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          nextEvent == 'CLOCK_IN' ? 'تسجيل الحضور' : 'تسجيل الانصراف',
+        ),
+        content: Text(
+          'سيتم تسجيل الوقت الحالي في ${widget.controller.branchName}.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('رجوع'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('تأكيد'),
+          ),
+        ],
+      ),
+    );
+    if (accepted != true || !mounted) return;
+    setState(() => recording = true);
+    try {
+      await widget.controller.api.request(
+        '/self/organizations/${widget.controller.organizationId}/employee/attendance',
+        method: 'POST',
+        body: {
+          'branchId': widget.controller.branchId,
+          'eventType': nextEvent,
+          'occurredAt': DateTime.now().toUtc().toIso8601String(),
+        },
+      );
+      await load();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            nextEvent == 'CLOCK_IN'
+                ? 'تم تسجيل حضورك بنجاح.'
+                : 'تم تسجيل انصرافك بنجاح.',
+          ),
+        ),
+      );
+    } catch (exception) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(_errorMessage(exception))));
+      }
+    } finally {
+      if (mounted) setState(() => recording = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final lastEvent = attendance.firstOrNull?['eventType']?.toString();
+    final nextClockIn = lastEvent != 'CLOCK_IN';
+    final name = employee?['name']?.toString() ?? widget.controller.displayName;
+    final number = employee?['employeeNumber']?.toString() ?? '';
+    final trainer =
+        (employee?['trainerProfileId']?.toString() ?? '').isNotEmpty;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'مساحة عملي',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+        actions: [
+          IconButton(
+            onPressed: loading ? null : () => unawaited(load()),
+            icon: const Icon(Icons.refresh_rounded),
+            tooltip: 'تحديث',
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: load,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 36),
+          children: [
+            if (loading)
+              const SizedBox(
+                height: 420,
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (employee == null)
+              _ResourceMessage(
+                icon: Icons.badge_outlined,
+                title: 'ملف الموظف غير متاح',
+                body: error ?? 'تعذر فتح مساحة العمل الشخصية.',
+                action: load,
+              )
+            else ...[
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [goInk, Color(0xFF33332E)],
+                  ),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Row(
+                  children: [
+                    const CircleAvatar(
+                      radius: 27,
+                      backgroundColor: goYellow,
+                      child: Icon(Icons.badge_outlined, color: goInk, size: 29),
+                    ),
+                    const SizedBox(width: 13),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            name,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 17,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          if (number.isNotEmpty)
+                            Text(
+                              '$number • ${widget.controller.branchName}',
+                              style: const TextStyle(
+                                color: Colors.white60,
+                                fontSize: 11,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              FilledButton.icon(
+                onPressed: recording
+                    ? null
+                    : () => unawaited(recordAttendance()),
+                icon: recording
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Icon(
+                        nextClockIn
+                            ? Icons.login_rounded
+                            : Icons.logout_rounded,
+                      ),
+                label: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Text(
+                    nextClockIn ? 'تسجيل الحضور الآن' : 'تسجيل الانصراف الآن',
+                  ),
+                ),
+              ),
+              if (trainer) ...[
+                const SizedBox(height: 9),
+                OutlinedButton.icon(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) =>
+                          TrainerSelfSpacePage(controller: widget.controller),
+                    ),
+                  ),
+                  icon: const Icon(Icons.fitness_center_rounded),
+                  label: const Text('فتح مساحة المدرب'),
+                ),
+              ],
+              if (error != null) ...[
+                const SizedBox(height: 12),
+                Text(error!, style: const TextStyle(color: Colors.red)),
+              ],
+              const SizedBox(height: 20),
+              const SectionHeader(title: 'المناوبات القادمة'),
+              const SizedBox(height: 8),
+              if (shifts.isEmpty)
+                const _CompactEmpty(
+                  text: 'لا توجد مناوبات خلال الفترة المحددة.',
+                )
+              else
+                ...shifts
+                    .take(8)
+                    .map(
+                      (row) => _SelfTimelineTile(
+                        icon: Icons.calendar_month_outlined,
+                        title: row['positionName']?.toString() ?? 'مناوبة عمل',
+                        subtitle:
+                            '${_displayValue('startsAt', row['startsAt'])} — ${_displayValue('endsAt', row['endsAt'])}',
+                        status: row['status']?.toString(),
+                      ),
+                    ),
+              const SizedBox(height: 20),
+              const SectionHeader(title: 'آخر حركات الحضور'),
+              const SizedBox(height: 8),
+              if (attendance.isEmpty)
+                const _CompactEmpty(text: 'لم تُسجل حركات حضور بعد.')
+              else
+                ...attendance
+                    .take(10)
+                    .map(
+                      (row) => _SelfTimelineTile(
+                        icon: row['eventType'] == 'CLOCK_IN'
+                            ? Icons.login_rounded
+                            : Icons.logout_rounded,
+                        title: row['eventType'] == 'CLOCK_IN'
+                            ? 'تسجيل حضور'
+                            : 'تسجيل انصراف',
+                        subtitle: _displayValue(
+                          'occurredAt',
+                          row['occurredAt'],
+                        ),
+                        status: row['method']?.toString(),
+                      ),
+                    ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CompactEmpty extends StatelessWidget {
+  const _CompactEmpty({required this.text});
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(18),
+    decoration: BoxDecoration(
+      border: Border.all(color: Theme.of(context).dividerColor),
+      borderRadius: BorderRadius.circular(16),
+    ),
+    child: Text(
+      text,
+      textAlign: TextAlign.center,
+      style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+    ),
+  );
+}
+
+class _SelfTimelineTile extends StatelessWidget {
+  const _SelfTimelineTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    this.status,
+  });
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final String? status;
+
+  @override
+  Widget build(BuildContext context) => Card(
+    margin: const EdgeInsets.only(bottom: 8),
+    child: ListTile(
+      leading: CircleAvatar(
+        backgroundColor: goYellow.withValues(alpha: .16),
+        child: Icon(icon, color: Colors.amber[800]),
+      ),
+      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
+      subtitle: Text(subtitle),
+      trailing: status?.isNotEmpty == true
+          ? Text(
+              _displayValue('status', status),
+              style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w800),
+            )
+          : null,
+    ),
+  );
+}
+
+typedef _PortalLoadResult = ({List<Map<String, dynamic>> rows, String? error});
+
+class TrainerSelfSpacePage extends StatefulWidget {
+  const TrainerSelfSpacePage({super.key, required this.controller});
+  final GoController controller;
+
+  @override
+  State<TrainerSelfSpacePage> createState() => _TrainerSelfSpacePageState();
+}
+
+class _TrainerSelfSpacePageState extends State<TrainerSelfSpacePage> {
+  Map<String, dynamic>? trainer;
+  List<Map<String, dynamic>> members = [];
+  List<Map<String, dynamic>> schedule = [];
+  List<Map<String, dynamic>> plans = [];
+  List<Map<String, dynamic>> commissions = [];
+  bool loading = true;
+  String? busyItemId;
+  String? error;
+  int tab = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(load());
+  }
+
+  Future<_PortalLoadResult> _loadRows(
+    String path, {
+    Map<String, String>? query,
+  }) async {
+    try {
+      final data = await widget.controller.api.request(path, query: query);
+      return (rows: _portalRows(data), error: null);
+    } catch (exception) {
+      return (rows: <Map<String, dynamic>>[], error: _errorMessage(exception));
+    }
+  }
+
+  Future<void> load() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      final base =
+          '/self/organizations/${widget.controller.organizationId}/trainer';
+      final profile = await widget.controller.api.request(base);
+      trainer = profile is Map
+          ? Map<String, dynamic>.from(profile)
+          : <String, dynamic>{};
+      final now = DateTime.now().toUtc();
+      final values = await Future.wait([
+        _loadRows('$base/members'),
+        _loadRows(
+          '$base/schedule',
+          query: {
+            'from': now.subtract(const Duration(days: 30)).toIso8601String(),
+            'to': now.add(const Duration(days: 60)).toIso8601String(),
+          },
+        ),
+        _loadRows('$base/training-plans', query: const {'limit': '100'}),
+        _loadRows('$base/commissions', query: const {'limit': '100'}),
+      ]);
+      members = values[0].rows;
+      schedule = values[1].rows;
+      plans = values[2].rows;
+      commissions = values[3].rows;
+      if (values.any((value) => value.error != null)) {
+        error = 'تم فتح مساحة المدرب، لكن تعذر تحديث بعض البيانات. اسحب الشاشة للمحاولة مجددًا.';
+      }
+    } catch (exception) {
+      trainer = null;
+      members = [];
+      schedule = [];
+      plans = [];
+      commissions = [];
+      error = exception is ApiFailure && exception.isNotFound
+          ? 'حساب الموظف غير مرتبط بملف مدرب نشط.'
+          : _errorMessage(exception);
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  Future<void> _runWorkflow(String id) async {
+    await _openWorkflow(context, widget.controller, _workflowById(id));
+    if (mounted) await load();
+  }
+
+  Future<void> _showMeasurements(Map<String, dynamic> member) async {
+    final id = member['memberId']?.toString() ?? member['id']?.toString() ?? '';
+    if (id.isEmpty) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+    try {
+      final data = await widget.controller.api.request(
+        '/self/organizations/${widget.controller.organizationId}/trainer/members/$id/measurements',
+        query: const {'limit': '12'},
+      );
+      if (!mounted) return;
+      Navigator.pop(context);
+      final rows = _portalRows(data);
+      await showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        isScrollControlled: true,
+        builder: (sheetContext) => DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: .68,
+          maxChildSize: .92,
+          builder: (_, scrollController) => ListView(
+            controller: scrollController,
+            padding: const EdgeInsets.fromLTRB(18, 0, 18, 28),
+            children: [
+              Text(
+                'قياسات ${member['memberName'] ?? member['name'] ?? 'المتدرب'}',
+                style: Theme.of(sheetContext).textTheme.titleLarge
+                    ?.copyWith(fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 12),
+              if (rows.isEmpty)
+                const _CompactEmpty(text: 'لم تُسجل قياسات لهذا المتدرب بعد.')
+              else
+                ...rows.map(
+                  (row) => _SelfTimelineTile(
+                    icon: Icons.monitor_weight_outlined,
+                    title:
+                        row['measurementName']?.toString() ??
+                        row['typeName']?.toString() ??
+                        'جلسة قياس',
+                    subtitle: _displayValue('measuredAt', row['measuredAt']),
+                    status: row['value']?.toString(),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    } catch (exception) {
+      if (!mounted) return;
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(_errorMessage(exception))));
+    }
+  }
+
+  Future<void> _transitionPlanItem(
+    Map<String, dynamic> plan,
+    Map<String, dynamic> item,
+    String status,
+  ) async {
+    final planId = plan['id']?.toString() ?? '';
+    final itemId = item['id']?.toString() ?? '';
+    if (planId.isEmpty || itemId.isEmpty) return;
+    setState(() => busyItemId = itemId);
+    try {
+      await widget.controller.api.request(
+        '/self/organizations/${widget.controller.organizationId}/trainer/training-plans/$planId/items/$itemId/transitions',
+        method: 'POST',
+        body: {'status': status},
+      );
+      await load();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              status == 'COMPLETED'
+                  ? 'تم اعتماد تنفيذ التمرين.'
+                  : 'تم تسجيل تخطي التمرين.',
+            ),
+          ),
+        );
+      }
+    } catch (exception) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(_errorMessage(exception))));
+      }
+    } finally {
+      if (mounted) setState(() => busyItemId = null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const tabs = [
+      ('المتدربون', Icons.people_outline_rounded),
+      ('جدولي', Icons.calendar_month_outlined),
+      ('خطط التدريب', Icons.fitness_center_outlined),
+      ('عمولاتي', Icons.payments_outlined),
+    ];
+    final name = trainer?['displayName']?.toString() ?? 'مدرب النادي';
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'مساحة المدرب',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+        actions: [
+          IconButton(
+            onPressed: loading ? null : () => unawaited(load()),
+            icon: const Icon(Icons.refresh_rounded),
+            tooltip: 'تحديث',
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: load,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 36),
+          children: [
+            if (loading)
+              const SizedBox(
+                height: 420,
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (trainer == null)
+              _ResourceMessage(
+                icon: Icons.fitness_center_outlined,
+                title: 'مساحة المدرب غير متاحة',
+                body: error ?? 'تأكد من ربط حسابك بملف مدرب نشط.',
+                action: load,
+              )
+            else ...[
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  color: goYellow.withValues(alpha: .14),
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(color: goYellow.withValues(alpha: .45)),
+                ),
+                child: Row(
+                  children: [
+                    const CircleAvatar(
+                      radius: 27,
+                      backgroundColor: goInk,
+                      child: Icon(
+                        Icons.fitness_center_rounded,
+                        color: goYellow,
+                      ),
+                    ),
+                    const SizedBox(width: 13),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'مرحبًا، $name',
+                            style: const TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          Text(
+                            '${members.length} متدربين • ${plans.where((row) => row['status'] == 'ACTIVE').length} خطط نشطة',
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: members.isEmpty
+                          ? null
+                          : () => unawaited(
+                              _runWorkflow('recordSelfTrainerMeasurement'),
+                            ),
+                      icon: const Icon(Icons.monitor_weight_outlined),
+                      label: const Text('تسجيل قياس'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: members.isEmpty
+                          ? null
+                          : () => unawaited(
+                              _runWorkflow('createSelfTrainerTrainingPlan'),
+                            ),
+                      icon: const Icon(Icons.playlist_add_rounded),
+                      label: const Text('خطة جديدة'),
+                    ),
+                  ),
+                ],
+              ),
+              if (error != null) ...[
+                const SizedBox(height: 10),
+                Text(
+                  error!,
+                  style: const TextStyle(color: Colors.red, fontSize: 12),
+                ),
+              ],
+              const SizedBox(height: 14),
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: tabs.indexed
+                      .map(
+                        (entry) => Padding(
+                          padding: const EdgeInsetsDirectional.only(end: 7),
+                          child: ChoiceChip(
+                            selected: tab == entry.$1,
+                            onSelected: (_) => setState(() => tab = entry.$1),
+                            avatar: Icon(entry.$2.$2, size: 17),
+                            label: Text(entry.$2.$1),
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (tab == 0) _membersTab(),
+              if (tab == 1) _scheduleTab(),
+              if (tab == 2) _plansTab(),
+              if (tab == 3) _commissionsTab(),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _membersTab() {
+    if (members.isEmpty) {
+      return const _CompactEmpty(text: 'لا يوجد متدربون مسندون إليك حاليًا.');
+    }
+    return Column(
+      children: members
+          .map(
+            (row) => Card(
+              margin: const EdgeInsets.only(bottom: 8),
+              child: ListTile(
+                onTap: () => unawaited(_showMeasurements(row)),
+                leading: CircleAvatar(
+                  backgroundColor: goYellow.withValues(alpha: .18),
+                  child: Text(
+                    (row['memberName']?.toString() ?? 'م').characters.first,
+                    style: const TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                ),
+                title: Text(
+                  row['memberName']?.toString() ?? 'متدرب',
+                  style: const TextStyle(fontWeight: FontWeight.w900),
+                ),
+                subtitle: Text(
+                  [
+                    row['memberNumber']?.toString(),
+                    row['branchName']?.toString(),
+                    if (row['activePlanName'] != null)
+                      'الخطة: ${row['activePlanName']}',
+                  ].whereType<String>().join(' • '),
+                ),
+                trailing: const Icon(Icons.chevron_left_rounded),
+              ),
+            ),
+          )
+          .toList(),
+    );
+  }
+
+  Widget _scheduleTab() {
+    if (schedule.isEmpty) {
+      return const _CompactEmpty(text: 'لا توجد جلسات في الفترة المحددة.');
+    }
+    return Column(
+      children: schedule
+          .map(
+            (row) => _SelfTimelineTile(
+              icon: Icons.event_available_outlined,
+              title: row['resourceName']?.toString() ?? 'جلسة تدريب',
+              subtitle:
+                  '${_displayValue('startsAt', row['startsAt'])} • ${row['branchName'] ?? widget.controller.branchName}',
+              status: row['status']?.toString(),
+            ),
+          )
+          .toList(),
+    );
+  }
+
+  Widget _plansTab() {
+    if (plans.isEmpty) {
+      return const _CompactEmpty(text: 'لم تُنشأ خطط تدريب للمتدربين بعد.');
+    }
+    return Column(
+      children: plans.map((plan) {
+        final rawItems = plan['items'];
+        final items = rawItems is List
+            ? rawItems
+                  .whereType<Map>()
+                  .map((row) => Map<String, dynamic>.from(row))
+                  .toList()
+            : <Map<String, dynamic>>[];
+        return Card(
+          margin: const EdgeInsets.only(bottom: 9),
+          child: ExpansionTile(
+            title: Text(
+              plan['name']?.toString() ?? 'خطة تدريب',
+              style: const TextStyle(fontWeight: FontWeight.w900),
+            ),
+            subtitle: Text(
+              '${plan['memberName'] ?? 'عضو'} • ${_displayValue('status', plan['status'])}',
+            ),
+            childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+            children: items.isEmpty
+                ? [const _CompactEmpty(text: 'لا توجد تمارين داخل هذه الخطة.')]
+                : items.map((item) {
+                    final status =
+                        item['completionStatus']?.toString() ?? 'PENDING';
+                    final id = item['id']?.toString() ?? '';
+                    return Container(
+                      margin: const EdgeInsets.only(top: 8),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .surfaceContainerHighest
+                            .withValues(alpha: .4),
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            status == 'COMPLETED'
+                                ? Icons.check_circle_rounded
+                                : status == 'SKIPPED'
+                                ? Icons.skip_next_rounded
+                                : Icons.radio_button_unchecked_rounded,
+                            color: status == 'COMPLETED'
+                                ? Colors.green
+                                : status == 'SKIPPED'
+                                ? Colors.orange
+                                : Colors.amber[800],
+                          ),
+                          const SizedBox(width: 9),
+                          Expanded(
+                            child: Text(
+                              item['exerciseName']?.toString() ?? 'تمرين',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                          if (status == 'PENDING' && plan['status'] == 'ACTIVE')
+                            PopupMenuButton<String>(
+                              enabled: busyItemId != id,
+                              onSelected: (value) => unawaited(
+                                _transitionPlanItem(plan, item, value),
+                              ),
+                              itemBuilder: (_) => const [
+                                PopupMenuItem(
+                                  value: 'COMPLETED',
+                                  child: Text('اعتماد التنفيذ'),
+                                ),
+                                PopupMenuItem(
+                                  value: 'SKIPPED',
+                                  child: Text('تسجيل التخطي'),
+                                ),
+                              ],
+                            ),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  Widget _commissionsTab() {
+    if (commissions.isEmpty) {
+      return const _CompactEmpty(text: 'لا توجد عمولات مسجلة حتى الآن.');
+    }
+    final total = commissions.fold<int>(
+      0,
+      (sum, row) =>
+          sum + (int.tryParse('${row['commissionAmountMinor'] ?? 0}') ?? 0),
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          margin: const EdgeInsets.only(bottom: 10),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: goYellow.withValues(alpha: .14),
+            borderRadius: BorderRadius.circular(18),
+          ),
+          child: Text(
+            'إجمالي العمولات: ${_money(total)}',
+            style: const TextStyle(fontWeight: FontWeight.w900),
+          ),
+        ),
+        ...commissions.map(
+          (row) => _SelfTimelineTile(
+            icon: Icons.payments_outlined,
+            title: _money(row['commissionAmountMinor'] ?? 0),
+            subtitle:
+                '${row['sourceType'] ?? 'عمولة'} • ${_displayValue('occurredAt', row['occurredAt'])}',
+            status: row['status']?.toString(),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class PointOfSaleMobilePage extends StatelessWidget {
+  const PointOfSaleMobilePage({super.key, required this.controller});
+
+  final GoController controller;
+
+  static const _workflowIds = <String>[
+    'createSubscription',
+    'checkoutServiceAtPos',
+    'checkoutRetailAtPos',
+    'checkoutOrder',
+    'recordPayment',
+    'recordSplitPayment',
+    'openCashierShift',
+    'closeCashierShift',
+  ];
+
+  static const _resourceEndings = <String>[
+    '/orders',
+    '/invoices',
+    '/payments',
+    '/cashier-shifts',
+  ];
+
+  Color _actionColor(String operationId) => switch (operationId) {
+    'createSubscription' => const Color(0xFF8B5CF6),
+    'checkoutServiceAtPos' => const Color(0xFF2563EB),
+    'checkoutRetailAtPos' => const Color(0xFF0891B2),
+    'checkoutOrder' => const Color(0xFFEA580C),
+    'recordPayment' => const Color(0xFF16A34A),
+    'recordSplitPayment' => const Color(0xFF0F766E),
+    'openCashierShift' => const Color(0xFF475569),
+    'closeCashierShift' => const Color(0xFF9F1239),
+    _ => goInk,
+  };
+
+  String _actionHint(String operationId) => switch (operationId) {
+    'createSubscription' => 'عضوية وفاتورة',
+    'checkoutServiceAtPos' => 'خدمة بسعر الفرع',
+    'checkoutRetailAtPos' => 'منتج ومخزون',
+    'checkoutOrder' => 'صنف من المطعم',
+    'recordPayment' => 'تحصيل فاتورة',
+    'recordSplitPayment' => 'وسيلتا دفع',
+    'openCashierShift' => 'بدء التحصيل النقدي',
+    'closeCashierShift' => 'جرد وتسجيل الفرق',
+    _ => 'إجراء سريع',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final actions = _workflowIds
+        .map(_workflowById)
+        .where((workflow) => _canRunWorkflow(controller, workflow))
+        .toList();
+    final resources = _resourceEndings
+        .map(_featureEnding)
+        .where((feature) => _canViewFeature(controller, feature))
+        .toList();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'نقطة البيع',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+      ),
+      body: RefreshIndicator(
+        onRefresh: () => controller.refresh(announce: true),
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(18, 12, 18, 34),
+          children: [
+            Container(
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(
+                color: goInk,
+                borderRadius: BorderRadius.circular(24),
+                boxShadow: [
+                  BoxShadow(
+                    color: goInk.withValues(alpha: .18),
+                    blurRadius: 24,
+                    offset: const Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 58,
+                    height: 58,
+                    decoration: BoxDecoration(
+                      color: goYellow,
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: const Icon(
+                      Icons.point_of_sale_rounded,
+                      color: goInk,
+                      size: 30,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'بيع وتحصيل من مكان واحد',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w900,
+                            fontSize: 17,
+                          ),
+                        ),
+                        const SizedBox(height: 5),
+                        Text(
+                          'الفرع الحالي: ${controller.branchName}',
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: .72),
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 22),
+            if (actions.isNotEmpty) ...[
+              const SectionHeader(title: 'عمليات البيع'),
+              const SizedBox(height: 11),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final itemWidth = constraints.maxWidth >= 520
+                      ? (constraints.maxWidth - 20) / 3
+                      : (constraints.maxWidth - 10) / 2;
+                  return Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: actions
+                        .map(
+                          (workflow) => SizedBox(
+                            width: itemWidth,
+                            child: _PosActionCard(
+                              workflow: workflow,
+                              color: _actionColor(workflow.operationId),
+                              hint: _actionHint(workflow.operationId),
+                              onTap: () => unawaited(
+                                _openWorkflow(context, controller, workflow),
+                              ),
+                            ),
+                          ),
+                        )
+                        .toList(),
+                  );
+                },
+              ),
+              const SizedBox(height: 23),
+            ],
+            if (resources.isNotEmpty) ...[
+              const SectionHeader(title: 'السجلات والمتابعة'),
+              const SizedBox(height: 11),
+              Card(
+                clipBehavior: Clip.antiAlias,
+                child: Column(
+                  children: [
+                    for (var index = 0; index < resources.length; index++) ...[
+                      ListTile(
+                        onTap: () => _openResource(
+                          context,
+                          controller,
+                          resources[index],
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 5,
+                        ),
+                        leading: CircleAvatar(
+                          backgroundColor: goYellow.withValues(alpha: .16),
+                          child: Icon(
+                            resources[index].icon,
+                            color: Colors.amber[800],
+                          ),
+                        ),
+                        title: Text(
+                          resources[index].title,
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                        subtitle: Text(resources[index].subtitle),
+                        trailing: const Icon(Icons.chevron_left_rounded),
+                      ),
+                      if (index < resources.length - 1)
+                        const Divider(height: 1, indent: 70),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+            if (actions.isEmpty && resources.isEmpty)
+              const _ResourceMessage(
+                icon: Icons.lock_outline_rounded,
+                title: 'نقطة البيع غير متاحة',
+                body: 'لا تتضمن صلاحيات الحساب الحالية عمليات أو سجلات البيع.',
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PosActionCard extends StatelessWidget {
+  const _PosActionCard({
+    required this.workflow,
+    required this.color,
+    required this.hint,
+    required this.onTap,
+  });
+
+  final MobileWorkflow workflow;
+  final Color color;
+  final String hint;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => Material(
+    color: color.withValues(alpha: .09),
+    borderRadius: BorderRadius.circular(20),
+    child: InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(20),
+      child: Container(
+        height: 132,
+        padding: const EdgeInsets.all(15),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: color.withValues(alpha: .22)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: BorderRadius.circular(13),
+              ),
+              child: Icon(workflow.icon, color: Colors.white, size: 21),
+            ),
+            const Spacer(),
+            Text(
+              workflow.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13),
+            ),
+            const SizedBox(height: 3),
+            Text(
+              hint,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 10.5,
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
 }
 
 class FeatureHubPage extends StatelessWidget {
@@ -8748,6 +14846,97 @@ class _AccessControlMobilePageState extends State<AccessControlMobilePage> {
     if (mounted) setState(() => loading = false);
   }
 
+  Future<void> runCredentialWorkflow(String operationId) async {
+    await _openWorkflow(context, widget.controller, _workflowById(operationId));
+    if (mounted) await load();
+  }
+
+  Future<void> manageDevice(Map<String, dynamic> device) async {
+    final id = device['id']?.toString() ?? '';
+    if (id.isEmpty) return;
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.tune_rounded),
+              title: const Text('تعديل وضع وحالة اللوحة'),
+              onTap: () => Navigator.pop(sheetContext, 'edit'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.key_rounded, color: Colors.orange),
+              title: const Text('تدوير مفتاح الاتصال'),
+              subtitle: const Text('سيُلغى المفتاح القديم فورًا'),
+              onTap: () => Navigator.pop(sheetContext, 'rotate'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !mounted) return;
+    final version = int.tryParse('${device['version'] ?? 1}') ?? 1;
+    final workflow = action == 'edit'
+        ? MobileWorkflow(
+            operationId: 'editAccessDevice:$id',
+            title: 'إعدادات لوحة البوابة',
+            description:
+                'غيّر وضع القرار أو أوقف اللوحة للصيانة مع الحفاظ على سجلها.',
+            submitLabel: 'حفظ إعدادات اللوحة',
+            successMessage: 'تم تحديث إعدادات لوحة البوابة.',
+            method: 'PATCH',
+            path: '/organizations/{organizationId}/access-devices/$id',
+            icon: Icons.tune_rounded,
+            fields: [
+              WorkflowField(
+                name: 'mode',
+                label: 'وضع التشغيل',
+                type: WorkflowFieldType.select,
+                required: true,
+                initialValue: device['mode']?.toString() ?? 'OBSERVE',
+                choices: [
+                  WorkflowChoice('OBSERVE', 'مراقبة فقط'),
+                  WorkflowChoice('ENFORCE', 'تنفيذ قرارات الدخول'),
+                ],
+              ),
+              WorkflowField(
+                name: 'status',
+                label: 'حالة اللوحة',
+                type: WorkflowFieldType.select,
+                required: true,
+                initialValue: device['status']?.toString() ?? 'ACTIVE',
+                choices: [
+                  WorkflowChoice('ACTIVE', 'نشطة'),
+                  WorkflowChoice('MAINTENANCE', 'صيانة'),
+                  WorkflowChoice('DISABLED', 'موقوفة'),
+                ],
+              ),
+            ],
+            body: (values, controller) => {
+              'expectedVersion': version,
+              'mode': values['mode'],
+              'status': values['status'],
+            },
+          )
+        : MobileWorkflow(
+            operationId: 'rotateAccessDeviceKey:$id',
+            title: 'تدوير مفتاح الاتصال',
+            description: 'سيصدر مفتاح جديد يظهر مرة واحدة، وسيتوقف المفتاح الحالي فور الحفظ.',
+            submitLabel: 'إصدار مفتاح جديد',
+            successMessage: 'تم تدوير مفتاح لوحة البوابة.',
+            method: 'POST',
+            path:
+                '/organizations/{organizationId}/access-devices/$id/key-rotations',
+            icon: Icons.key_rounded,
+            fields: const [],
+            body: (values, controller) => {'expectedVersion': version},
+          );
+    await _openWorkflow(context, widget.controller, workflow);
+    if (mounted) await load();
+  }
+
   @override
   Widget build(BuildContext context) {
     final visibleEvents = selectedDeviceId == null
@@ -8830,6 +15019,37 @@ class _AccessControlMobilePageState extends State<AccessControlMobilePage> {
               ),
             ),
             const SizedBox(height: 12),
+            if (widget.controller.can('access-credentials.manage')) ...[
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  FilledButton.icon(
+                    onPressed: () =>
+                        unawaited(runCredentialWorkflow('issueAccessBarcode')),
+                    icon: const Icon(Icons.qr_code_2_rounded),
+                    label: const Text('إصدار بطاقة دخول'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => unawaited(
+                      runCredentialWorkflow('assignFingerprintPin'),
+                    ),
+                    icon: const Icon(Icons.fingerprint_rounded),
+                    label: const Text('ربط PIN البصمة'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+            ],
+            if (widget.controller.can('attendance.devices.manage')) ...[
+              FilledButton.tonalIcon(
+                onPressed: () =>
+                    unawaited(runCredentialWorkflow('registerAccessDevice')),
+                icon: const Icon(Icons.add_to_home_screen_outlined),
+                label: const Text('تسجيل لوحة بوابة جديدة'),
+              ),
+              const SizedBox(height: 12),
+            ],
             LayoutBuilder(
               builder: (context, constraints) {
                 final width = constraints.maxWidth > 620
@@ -8901,6 +15121,9 @@ class _AccessControlMobilePageState extends State<AccessControlMobilePage> {
                 (device) => _GateDeviceCard(
                   device: device,
                   selected: selectedDeviceId == device['id']?.toString(),
+                  onManage: widget.controller.can('attendance.devices.manage')
+                      ? () => unawaited(manageDevice(device))
+                      : null,
                   onEvents: () => setState(() {
                     selectedDeviceId = device['id']?.toString();
                     view = 'events';
@@ -8996,10 +15219,12 @@ class _GateDeviceCard extends StatelessWidget {
     required this.device,
     required this.selected,
     required this.onEvents,
+    this.onManage,
   });
   final Map<String, dynamic> device;
   final bool selected;
   final VoidCallback onEvents;
+  final VoidCallback? onManage;
 
   @override
   Widget build(BuildContext context) {
@@ -9075,6 +15300,14 @@ class _GateDeviceCard extends StatelessWidget {
                 selected ? 'عرض السجل المحدد' : 'عرض أحداث هذه البوابة',
               ),
             ),
+            if (onManage != null) ...[
+              const SizedBox(height: 8),
+              TextButton.icon(
+                onPressed: onManage,
+                icon: const Icon(Icons.settings_outlined),
+                label: const Text('إدارة إعدادات اللوحة ومفتاحها'),
+              ),
+            ],
           ],
         ),
       ),
@@ -9263,59 +15496,6 @@ String _gateSystemReason(Map<String, dynamic> event) {
   if (status == 'DEVICE_DENIED') return 'رفضته اللوحة';
   if (status == 'FAILED') return 'فشل المعالجة';
   return event['direction']?.toString() == 'OUT' ? 'حدث خروج' : 'تم تجاهله';
-}
-
-class WorkflowHubPage extends StatelessWidget {
-  const WorkflowHubPage({super.key, required this.controller});
-  final GoController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    final workflows = mobileWorkflows
-        .where((workflow) => _canRunWorkflow(controller, workflow))
-        .toList();
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'الإجراءات الأساسية',
-          style: TextStyle(fontWeight: FontWeight.w900),
-        ),
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(18),
-        children: [
-          const Text(
-            'نماذج جاهزة ومتحقق منها لأكثر عمليات GO استخدامًا. تُنفذ داخل الفرع الحالي وبحسب صلاحيات حسابك.',
-            style: TextStyle(height: 1.6),
-          ),
-          const SizedBox(height: 14),
-          ...workflows.map(
-            (workflow) => Card(
-              margin: const EdgeInsets.only(bottom: 9),
-              child: ListTile(
-                onTap: () =>
-                    unawaited(_openWorkflow(context, controller, workflow)),
-                leading: CircleAvatar(
-                  backgroundColor: goYellow.withValues(alpha: .16),
-                  child: Icon(workflow.icon, color: Colors.amber[800]),
-                ),
-                title: Text(
-                  workflow.title,
-                  style: const TextStyle(fontWeight: FontWeight.w800),
-                ),
-                subtitle: Text(
-                  workflow.description,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                trailing: const Icon(Icons.chevron_left_rounded),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 }
 
 enum ReportRangeType { none, businessDate, instant }
@@ -10516,13 +16696,17 @@ class _WorkflowPageState extends State<WorkflowPage> {
     final now = DateTime.now();
     for (final field in widget.workflow.fields) {
       var initial = field.initialValue;
-      if (field.type == WorkflowFieldType.dateTime && initial.isEmpty) {
+      if (field.type == WorkflowFieldType.dateTime &&
+          field.autoFillDate &&
+          initial.isEmpty) {
         final date = field.name.toLowerCase().contains('end')
             ? now.add(const Duration(hours: 1))
             : now;
         initial = _localDateTimeValue(date);
       }
-      if (field.type == WorkflowFieldType.date && initial.isEmpty) {
+      if (field.type == WorkflowFieldType.date &&
+          field.autoFillDate &&
+          initial.isEmpty) {
         initial = now.toIso8601String().substring(0, 10);
       }
       controllers[field.name] = TextEditingController(text: initial);
@@ -10559,7 +16743,9 @@ class _WorkflowPageState extends State<WorkflowPage> {
   Future<void> _loadReferences() async {
     try {
       for (final field in widget.workflow.fields.where(
-        (item) => item.type == WorkflowFieldType.reference,
+        (item) =>
+            item.type == WorkflowFieldType.reference ||
+            item.type == WorkflowFieldType.multiReference,
       )) {
         await _loadReference(field);
       }
@@ -10617,6 +16803,24 @@ class _WorkflowPageState extends State<WorkflowPage> {
       );
       return;
     }
+    if (widget.workflow.operationId.startsWith('freezeSelfSubscription:')) {
+      if ((values['reason'] ?? '').length < 3) {
+        setState(() => error = 'اكتب سببًا واضحًا من 3 أحرف على الأقل.');
+        return;
+      }
+      if (values['freezeMode'] == 'LATER') {
+        final scheduled = DateTime.tryParse(values['scheduledStartAt'] ?? '');
+        if (scheduled == null || !scheduled.isAfter(DateTime.now())) {
+          setState(() => error = 'اختر موعدًا مستقبليًا صالحًا لبدء التجميد.');
+          return;
+        }
+      }
+    }
+    if (widget.workflow.operationId.startsWith('cancelSelfFreezeSchedule:') &&
+        (values['reason'] ?? '').length < 3) {
+      setState(() => error = 'اكتب سببًا واضحًا من 3 أحرف على الأقل.');
+      return;
+    }
     if (widget.workflow.operationId == 'createEmployee') {
       if ((values['password'] ?? '').length < 7) {
         setState(() => error = 'كلمة المرور يجب ألا تقل عن 7 محارف.');
@@ -10631,6 +16835,16 @@ class _WorkflowPageState extends State<WorkflowPage> {
         ((values['serviceId'] ?? '').isEmpty ||
             (values['resourceType'] ?? '').isEmpty)) {
       setState(() => error = 'بيانات المورد غير مكتملة؛ أعد اختيار المورد.');
+      return;
+    }
+    if (widget.workflow.operationId == 'recordSplitPayment' &&
+        values['firstMethod'] == values['secondMethod']) {
+      setState(() => error = 'اختر وسيلتي دفع مختلفتين للتحصيل المقسّم.');
+      return;
+    }
+    if (widget.workflow.operationId == 'closeCashierShift' &&
+        (values['reason'] ?? '').length < 3) {
+      setState(() => error = 'اكتب ملاحظة إغلاق واضحة من 3 أحرف على الأقل.');
       return;
     }
     final accepted = await showDialog<bool>(
@@ -10657,11 +16871,151 @@ class _WorkflowPageState extends State<WorkflowPage> {
     });
     try {
       final path = _resolve(widget.workflow.path);
-      await widget.controller.api.request(
+      final result = await widget.controller.api.request(
         path,
         method: widget.workflow.method,
         body: widget.workflow.body(values, widget.controller),
       );
+      if ((widget.workflow.operationId == 'registerAccessDevice' ||
+              widget.workflow.operationId.startsWith(
+                'rotateAccessDeviceKey:',
+              )) &&
+          result is Map &&
+          mounted) {
+        final apiKey = result['apiKey']?.toString() ?? '';
+        if (apiKey.isNotEmpty) {
+          await showDialog<void>(
+            context: context,
+            barrierDismissible: false,
+            builder: (dialogContext) => AlertDialog(
+              icon: const Icon(Icons.vpn_key_rounded, color: Colors.orange),
+              title: const Text('احفظ مفتاح اتصال اللوحة'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'لن يعرض النظام هذا المفتاح مرة أخرى. انسخه الآن وضعه في إعداد أداة ربط البوابة.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(height: 1.55),
+                    ),
+                    const SizedBox(height: 14),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Theme.of(dialogContext)
+                            .colorScheme
+                            .surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: SelectableText(
+                        apiKey,
+                        textDirection: TextDirection.ltr,
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await Clipboard.setData(ClipboardData(text: apiKey));
+                    if (!dialogContext.mounted) return;
+                    ScaffoldMessenger.of(dialogContext).showSnackBar(
+                      const SnackBar(content: Text('تم نسخ مفتاح الاتصال.')),
+                    );
+                  },
+                  icon: const Icon(Icons.copy_rounded),
+                  label: const Text('نسخ المفتاح'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('حفظته'),
+                ),
+              ],
+            ),
+          );
+        }
+      }
+      if (widget.workflow.operationId == 'issueAccessBarcode' &&
+          result is Map &&
+          mounted) {
+        final issued = Map<String, dynamic>.from(result);
+        final barcodeValue = issued['credentialValue']?.toString() ?? '';
+        if (barcodeValue.isNotEmpty) {
+          await showDialog<void>(
+            context: context,
+            barrierDismissible: false,
+            builder: (dialogContext) => AlertDialog(
+              title: const Text('بطاقة الدخول جاهزة'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Image.asset(
+                      'assets/go-fitness-emblem.png',
+                      width: 74,
+                      height: 52,
+                      fit: BoxFit.contain,
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      issued['subjectName']?.toString() ??
+                          issued['name']?.toString() ??
+                          'بطاقة GO Fitness',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontWeight: FontWeight.w900),
+                    ),
+                    const SizedBox(height: 22),
+                    Container(
+                      color: Colors.white,
+                      padding: const EdgeInsets.all(12),
+                      child: barcode_ui.BarcodeWidget(
+                        barcode: barcode_ui.Barcode.code39(),
+                        data: barcodeValue,
+                        width: 260,
+                        height: 92,
+                        drawText: false,
+                        color: Colors.black,
+                        backgroundColor: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    SelectableText(
+                      barcodeValue,
+                      textDirection: TextDirection.ltr,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 2,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'احفظ البطاقة أو اعرضها مباشرة أمام قارئ البوابة.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                FilledButton.icon(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  icon: const Icon(Icons.check_circle_outline),
+                  label: const Text('تم'),
+                ),
+              ],
+            ),
+          );
+        }
+      }
       if (mounted) Navigator.pop(context, true);
     } catch (exception) {
       if (mounted) {
@@ -10741,6 +17095,23 @@ class _WorkflowPageState extends State<WorkflowPage> {
 
   Widget _buildField(WorkflowField field) {
     final controller = controllers[field.name]!;
+    if (field.type == WorkflowFieldType.checkbox) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: FormField<bool>(
+          initialValue: controller.text == 'true',
+          builder: (state) => SwitchListTile.adaptive(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+            title: Text(field.label),
+            value: controller.text == 'true',
+            onChanged: (value) => setState(() {
+              controller.text = '$value';
+              state.didChange(value);
+            }),
+          ),
+        ),
+      );
+    }
     if (field.type == WorkflowFieldType.select) {
       return Padding(
         padding: const EdgeInsets.only(bottom: 12),
@@ -10795,8 +17166,10 @@ class _WorkflowPageState extends State<WorkflowPage> {
                 .firstOrNull;
             if (selected != null) {
               for (final binding in field.copyValues.entries) {
-                controllers[binding.key]?.text =
-                    selected[binding.value]?.toString() ?? '';
+                final copied =
+                    selected[binding.value] ??
+                    (binding.value == 'resourceType' ? selected['type'] : null);
+                controllers[binding.key]?.text = copied?.toString() ?? '';
               }
             }
             for (final dependent in widget.workflow.fields.where(
@@ -10810,6 +17183,49 @@ class _WorkflowPageState extends State<WorkflowPage> {
           validator: (value) => field.required && (value?.isEmpty ?? true)
               ? 'اختر ${field.label}.'
               : null,
+        ),
+      );
+    }
+    if (field.type == WorkflowFieldType.multiReference) {
+      final rows = references[field.name] ?? [];
+      final selected = controller.text
+          .split(',')
+          .where((value) => value.isNotEmpty)
+          .toSet();
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 16),
+        child: FormField<String>(
+          initialValue: controller.text,
+          validator: (_) => field.required && selected.isEmpty
+              ? 'اختر عنصرًا واحدًا على الأقل.'
+              : null,
+          builder: (state) => InputDecorator(
+            decoration: InputDecoration(
+              labelText: field.label,
+              errorText: state.errorText,
+              helperText: rows.isEmpty ? 'لا توجد عناصر متاحة.' : null,
+            ),
+            child: Wrap(
+              spacing: 7,
+              runSpacing: 7,
+              children: rows.map((row) {
+                final id = _referenceId(row);
+                return FilterChip(
+                  label: Text(_referenceLabel(row, field)),
+                  selected: selected.contains(id),
+                  onSelected: (enabled) => setState(() {
+                    if (enabled) {
+                      selected.add(id);
+                    } else {
+                      selected.remove(id);
+                    }
+                    controller.text = selected.join(',');
+                    state.didChange(controller.text);
+                  }),
+                );
+              }).toList(),
+            ),
+          ),
         ),
       );
     }
@@ -10848,8 +17264,12 @@ class _WorkflowPageState extends State<WorkflowPage> {
           }
           if (field.type == WorkflowFieldType.number &&
               value?.trim().isNotEmpty == true &&
-              (double.tryParse(value!) ?? 0) <= 0) {
-            return 'أدخل قيمة أكبر من صفر.';
+              (field.allowZero
+                  ? (double.tryParse(value!) ?? -1) < 0
+                  : (double.tryParse(value!) ?? 0) <= 0)) {
+            return field.allowZero
+                ? 'أدخل قيمة تساوي صفرًا أو أكبر.'
+                : 'أدخل قيمة أكبر من صفر.';
           }
           if (field.type == WorkflowFieldType.email &&
               value?.trim().isNotEmpty == true &&
@@ -10867,7 +17287,13 @@ String _localDateTimeValue(DateTime value) =>
     '${value.year.toString().padLeft(4, '0')}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')}T${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
 
 String _referenceId(Map row) =>
-    (row['id'] ?? row['memberId'] ?? row['invoiceId'] ?? '').toString();
+    (row['id'] ??
+            row['memberId'] ??
+            row['invoiceId'] ??
+            row['userAccountId'] ??
+            row['code'] ??
+            '')
+        .toString();
 
 String _referenceLabel(Map<String, dynamic> row, WorkflowField field) {
   String first(List<String> keys) => keys
@@ -10889,13 +17315,79 @@ MobileWorkflow? _workflowForFeature(ResourceFeature feature) {
     '/organizations/{organizationId}/restaurant-orders' => 'checkoutOrder',
     '/organizations/{organizationId}/employee-shifts' =>
       'scheduleEmployeeShift',
+    '/organizations/{organizationId}/employee-attendance' =>
+      'recordEmployeeAttendance',
     '/organizations/{organizationId}/other-income' => 'recordOtherIncome',
     '/organizations/{organizationId}/reservations' => 'createManualReservation',
     '/organizations/{organizationId}/employees' => 'createEmployee',
     '/organizations/{organizationId}/measurement-sessions' =>
       'recordMeasurementSession',
+    '/organizations/{organizationId}/branches' => 'createBranch',
+    '/organizations/{organizationId}/activities' => 'createActivity',
+    '/organizations/{organizationId}/service-categories' =>
+      'createServiceCategory',
+    '/organizations/{organizationId}/services' => 'createService',
+    '/organizations/{organizationId}/packages' => 'createPackage',
+    '/organizations/{organizationId}/prices' => 'createPrice',
+    '/organizations/{organizationId}/promotions' => 'createPromotion',
+    '/organizations/{organizationId}/commercial-policies' =>
+      'createCommercialPolicy',
+    '/organizations/{organizationId}/cash-points' => 'createCashPoint',
+    '/organizations/{organizationId}/cashier-shifts' => 'openCashierShift',
+    '/organizations/{organizationId}/lockers' => 'createLocker',
+    '/organizations/{organizationId}/measurement-types' =>
+      'createMeasurementType',
+    '/organizations/{organizationId}/positions' => 'createPosition',
+    '/organizations/{organizationId}/facilities' => 'createFacility',
+    '/organizations/{organizationId}/bookable-resources' =>
+      'createBookableResource',
+    '/organizations/{organizationId}/roles' => 'createRole',
+    '/organizations/{organizationId}/role-assignments' =>
+      'createRoleAssignment',
+    '/organizations/{organizationId}/notification-templates' =>
+      'createNotificationTemplate',
+    '/organizations/{organizationId}/retail/categories' =>
+      'createRetailCategory',
+    '/organizations/{organizationId}/retail/products' => 'createRetailProduct',
+    '/organizations/{organizationId}/retail/prices' => 'createRetailPrice',
+    '/organizations/{organizationId}/retail/inventory' => 'adjustRetailStock',
+    '/organizations/{organizationId}/expense-categories' =>
+      'createExpenseCategory',
+    '/organizations/{organizationId}/restaurant/meal-categories' =>
+      'createMealCategory',
+    '/organizations/{organizationId}/restaurant/meals' =>
+      'createRestaurantMeal',
+    '/organizations/{organizationId}/restaurant/meal-prices' =>
+      'createRestaurantMealPrice',
+    '/organizations/{organizationId}/branches/{branchId}/daily-menus/{businessDate}' =>
+      'createDailyMenu',
+    '/organizations/{organizationId}/access-credentials' =>
+      'issueAccessBarcode',
+    '/organizations/{organizationId}/coaching-specialties' =>
+      'createCoachingSpecialty',
+    '/organizations/{organizationId}/trainers' => 'createTrainerProfile',
+    '/organizations/{organizationId}/other-income-categories' =>
+      'createOtherIncomeCategory',
+    '/organizations/{organizationId}/communication-templates' =>
+      'createCommunicationTemplate',
+    '/organizations/{organizationId}/communication-campaigns' =>
+      'createCommunicationCampaign',
+    '/organizations/{organizationId}/whatsapp-campaigns' =>
+      'createWhatsAppCampaign',
+    '/organizations/{organizationId}/trainer-commission-plans' =>
+      'createCommissionPlan',
+    '/organizations/{organizationId}/trainer-commissions' =>
+      'accrueTrainerCommission',
+    '/organizations/{organizationId}/training-plan-templates' =>
+      'createTrainingPlanTemplate',
+    '/organizations/{organizationId}/member-training-plans' =>
+      'createMemberTrainingPlan',
+    '/organizations/{organizationId}/crm/lead-sources' => 'createCrmLeadSource',
     '/self/organizations/{organizationId}/packages' =>
       'checkoutSelfMemberPackage',
+    '/self/organizations/{organizationId}/services' => 'checkoutSelfService',
+    '/self/organizations/{organizationId}/bookable-resources' =>
+      'checkoutSelfBooking',
     '/self/organizations/{organizationId}/members/{memberId}/feedback-cases' =>
       'createSelfMemberFeedback',
     _ => '',
@@ -10903,6 +17395,557 @@ MobileWorkflow? _workflowForFeature(ResourceFeature feature) {
   return mobileWorkflows
       .where((workflow) => workflow.operationId == operation)
       .firstOrNull;
+}
+
+MobileWorkflow? _editWorkflowForFeature(
+  GoController controller,
+  ResourceFeature feature,
+  Map<String, dynamic> row,
+) {
+  final permission = <String, String>{
+    '/organizations/{organizationId}/branches': 'branch.manage',
+    '/organizations/{organizationId}/activities': 'catalog.manage',
+    '/organizations/{organizationId}/service-categories': 'catalog.manage',
+    '/organizations/{organizationId}/services': 'catalog.manage',
+    '/organizations/{organizationId}/cash-points': 'finance.cash-points.manage',
+    '/organizations/{organizationId}/measurement-types':
+        'measurement-types.manage',
+    '/organizations/{organizationId}/positions': 'workforce.manage',
+    '/organizations/{organizationId}/facilities': 'bookings.facilities.manage',
+    '/organizations/{organizationId}/bookable-resources':
+        'bookings.facilities.manage',
+    '/organizations/{organizationId}/roles': 'iam.roles.manage',
+    '/organizations/{organizationId}/notification-templates':
+        'notification-templates.manage',
+    '/organizations/{organizationId}/retail/categories':
+        'retail.catalog.manage',
+    '/organizations/{organizationId}/retail/products': 'retail.catalog.manage',
+    '/organizations/{organizationId}/expense-categories':
+        'finance.expenses.manage',
+    '/organizations/{organizationId}/restaurant/meal-categories':
+        'restaurant.catalog.manage',
+  }[feature.path];
+  if (permission == null || !controller.can(permission)) return null;
+  final id = _rowId(row, ['id']);
+  if (id.isEmpty) return null;
+  final version = int.tryParse('${row['version'] ?? 1}') ?? 1;
+  String value(String key) => row[key]?.toString() ?? '';
+  const statusChoices = [
+    WorkflowChoice('ACTIVE', 'نشط'),
+    WorkflowChoice('INACTIVE', 'غير نشط / مؤرشف'),
+  ];
+  WorkflowField statusField({List<WorkflowChoice> choices = statusChoices}) =>
+      WorkflowField(
+        name: 'status',
+        label: 'الحالة',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: value('status').isEmpty ? 'ACTIVE' : value('status'),
+        choices: choices,
+      );
+  MobileWorkflow edit({
+    required List<WorkflowField> fields,
+    required WorkflowBodyBuilder body,
+    String method = 'PATCH',
+    String? path,
+  }) => MobileWorkflow(
+    operationId: 'edit:${feature.path}',
+    title: 'تعديل ${feature.title}',
+    description: 'راجع البيانات والحالة قبل حفظ التغييرات.',
+    submitLabel: 'حفظ التغيرات',
+    successMessage: 'تم حفظ التغيرات.',
+    method: method,
+    path: path ?? '${feature.path}/$id',
+    icon: Icons.edit_outlined,
+    fields: fields,
+    body: body,
+  );
+
+  if ({
+    '/organizations/{organizationId}/activities',
+    '/organizations/{organizationId}/service-categories',
+    '/organizations/{organizationId}/retail/categories',
+    '/organizations/{organizationId}/restaurant/meal-categories',
+  }.contains(feature.path)) {
+    return edit(
+      fields: [
+        WorkflowField(
+          name: 'name',
+          label: 'الاسم',
+          required: true,
+          initialValue: value('name'),
+        ),
+        statusField(),
+      ],
+      body: (values, controller) => {
+        'name': values['name']?.trim(),
+        'status': values['status'],
+        'expectedVersion': version,
+      },
+    );
+  }
+  switch (feature.path) {
+    case '/organizations/{organizationId}/branches':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم الفرع',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'timezone',
+            label: 'المنطقة الزمنية',
+            initialValue: value('timezone'),
+          ),
+          WorkflowField(
+            name: 'address',
+            label: 'العنوان',
+            type: WorkflowFieldType.textarea,
+            initialValue: value('address'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'name': values['name']?.trim(),
+          if (values['timezone']?.isNotEmpty == true)
+            'timezone': values['timezone'],
+          if (values['address']?.isNotEmpty == true)
+            'address': values['address'],
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/cash-points':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم نقطة التحصيل',
+            required: true,
+            initialValue: value('name'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'branchId': row['branchId'] ?? controller.branchId,
+          'name': values['name']?.trim(),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/measurement-types':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم القياس',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'unit',
+            label: 'الوحدة',
+            required: true,
+            initialValue: value('unit'),
+          ),
+          WorkflowField(
+            name: 'minimumValue',
+            label: 'أقل قيمة',
+            type: WorkflowFieldType.number,
+            initialValue: value('minimumValue'),
+          ),
+          WorkflowField(
+            name: 'maximumValue',
+            label: 'أعلى قيمة',
+            type: WorkflowFieldType.number,
+            initialValue: value('maximumValue'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'name': values['name']?.trim(),
+          'unit': values['unit']?.trim(),
+          if (values['minimumValue']?.isNotEmpty == true)
+            'minimumValue': double.tryParse(values['minimumValue']!),
+          if (values['maximumValue']?.isNotEmpty == true)
+            'maximumValue': double.tryParse(values['maximumValue']!),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/positions':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'المسمى الوظيفي',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'permissions',
+            label: 'صلاحيات المسمى',
+            type: WorkflowFieldType.multiReference,
+            required: true,
+            initialValue: _initialIds(row['permissions']),
+            referencePath: '/organizations/{organizationId}/permissions',
+            labelKeys: ['description', 'code'],
+            subtitleKeys: ['code', 'category'],
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'name': values['name']?.trim(),
+          'permissions': _selectedValues(values['permissions']),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/facilities':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم المرفق',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'type',
+            label: 'نوع المرفق',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('type'),
+            choices: const [
+              WorkflowChoice('COURT', 'ملعب'),
+              WorkflowChoice('ROOM', 'غرفة'),
+              WorkflowChoice('POOL', 'مسبح'),
+              WorkflowChoice('STUDIO', 'استوديو'),
+              WorkflowChoice('TRAINING_AREA', 'منطقة تدريب'),
+            ],
+          ),
+          WorkflowField(
+            name: 'activityId',
+            label: 'النشاط',
+            type: WorkflowFieldType.reference,
+            initialValue: value('activityId'),
+            referencePath: '/organizations/{organizationId}/activities',
+            labelKeys: ['name'],
+            subtitleKeys: ['code'],
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'branchId': row['branchId'] ?? controller.branchId,
+          'name': values['name']?.trim(),
+          'type': values['type'],
+          'activityId': values['activityId']?.isEmpty == true
+              ? null
+              : values['activityId'],
+          'status': values['status'],
+        },
+      );
+    case '/organizations/{organizationId}/bookable-resources':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'facilityId',
+            label: 'المرفق',
+            type: WorkflowFieldType.reference,
+            required: true,
+            initialValue: value('facilityId'),
+            referencePath: '/organizations/{organizationId}/facilities',
+            labelKeys: ['name'],
+            subtitleKeys: ['code'],
+          ),
+          WorkflowField(
+            name: 'serviceId',
+            label: 'الخدمة',
+            type: WorkflowFieldType.reference,
+            required: true,
+            initialValue: value('serviceId'),
+            referencePath: '/organizations/{organizationId}/services',
+            labelKeys: ['name'],
+            subtitleKeys: ['code'],
+          ),
+          WorkflowField(
+            name: 'cancellationPolicyVersionId',
+            label: 'سياسة الإلغاء',
+            type: WorkflowFieldType.reference,
+            required: true,
+            initialValue: value('cancellationPolicyVersionId'),
+            referencePath:
+                '/organizations/{organizationId}/commercial-policies',
+            labelKeys: ['name'],
+            subtitleKeys: ['policyType', 'versionNumber'],
+          ),
+          WorkflowField(
+            name: 'name',
+            label: 'اسم المورد',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'type',
+            label: 'نوع الحجز',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('type'),
+            choices: const [
+              WorkflowChoice('COURT', 'ملعب'),
+              WorkflowChoice('CLASS', 'حصة جماعية'),
+              WorkflowChoice('PERSONAL_TRAINING', 'تدريب شخصي'),
+              WorkflowChoice('APPOINTMENT', 'موعد فردي'),
+            ],
+          ),
+          WorkflowField(
+            name: 'capacity',
+            label: 'السعة',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: value('capacity'),
+          ),
+          statusField(
+            choices: const [
+              WorkflowChoice('ACTIVE', 'نشط'),
+              WorkflowChoice('MAINTENANCE', 'صيانة'),
+              WorkflowChoice('INACTIVE', 'غير نشط'),
+            ],
+          ),
+        ],
+        body: (values, controller) => {
+          'branchId': row['branchId'] ?? controller.branchId,
+          'facilityId': values['facilityId'],
+          'serviceId': values['serviceId'],
+          'cancellationPolicyVersionId': values['cancellationPolicyVersionId'],
+          'name': values['name']?.trim(),
+          'type': values['type'],
+          'capacity': values['type'] == 'CLASS'
+              ? int.tryParse(values['capacity'] ?? '') ?? 1
+              : 1,
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/roles':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم المجموعة',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'description',
+            label: 'الوصف',
+            type: WorkflowFieldType.textarea,
+            initialValue: value('description'),
+          ),
+          WorkflowField(
+            name: 'permissions',
+            label: 'الصلاحيات',
+            type: WorkflowFieldType.multiReference,
+            initialValue: _initialIds(row['permissions']),
+            referencePath: '/organizations/{organizationId}/permissions',
+            labelKeys: ['description', 'code'],
+            subtitleKeys: ['code'],
+          ),
+        ],
+        body: (values, controller) => {
+          'name': values['name']?.trim(),
+          'description': values['description']?.trim().isEmpty == true
+              ? null
+              : values['description']?.trim(),
+          'permissions': _selectedValues(values['permissions']),
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/services':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم الخدمة',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'categoryId',
+            label: 'التصنيف',
+            type: WorkflowFieldType.reference,
+            initialValue: value('categoryId'),
+            referencePath: '/organizations/{organizationId}/service-categories',
+            labelKeys: ['name'],
+            subtitleKeys: ['code'],
+          ),
+          WorkflowField(
+            name: 'activityIds',
+            label: 'الأنشطة',
+            type: WorkflowFieldType.multiReference,
+            initialValue: _initialIds(row['activityIds'] ?? row['activities']),
+            referencePath: '/organizations/{organizationId}/activities',
+            labelKeys: ['name'],
+            subtitleKeys: ['code'],
+          ),
+          WorkflowField(
+            name: 'description',
+            label: 'الوصف',
+            type: WorkflowFieldType.textarea,
+            initialValue: value('description'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'name': values['name']?.trim(),
+          if (values['categoryId']?.isNotEmpty == true)
+            'categoryId': values['categoryId'],
+          'activityIds': _selectedValues(values['activityIds']),
+          if (values['description']?.isNotEmpty == true)
+            'description': values['description'],
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/retail/products':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'categoryId',
+            label: 'التصنيف',
+            type: WorkflowFieldType.reference,
+            required: true,
+            initialValue: value('categoryId'),
+            referencePath: '/organizations/{organizationId}/retail/categories',
+            labelKeys: ['name'],
+            subtitleKeys: ['code'],
+          ),
+          WorkflowField(
+            name: 'barcode',
+            label: 'الباركود',
+            initialValue: value('barcode'),
+          ),
+          WorkflowField(
+            name: 'name',
+            label: 'اسم المنتج',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'unit',
+            label: 'وحدة البيع',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('unit'),
+            choices: const [
+              WorkflowChoice('UNIT', 'قطعة'),
+              WorkflowChoice('PAIR', 'زوج'),
+              WorkflowChoice('BOTTLE', 'زجاجة'),
+              WorkflowChoice('CAN', 'علبة'),
+              WorkflowChoice('PACK', 'عبوة'),
+              WorkflowChoice('BOX', 'صندوق'),
+              WorkflowChoice('KG', 'كيلوجرام'),
+            ],
+          ),
+          WorkflowField(
+            name: 'description',
+            label: 'الوصف',
+            type: WorkflowFieldType.textarea,
+            initialValue: value('description'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'categoryId': values['categoryId'],
+          if (values['barcode']?.isNotEmpty == true)
+            'barcode': values['barcode'],
+          'name': values['name']?.trim(),
+          'unit': values['unit'],
+          if (values['description']?.isNotEmpty == true)
+            'description': values['description'],
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/expense-categories':
+      final currentMinor =
+          double.tryParse(
+            '${row['approvalThresholdMinor'] ?? row['approvalLimitMinor'] ?? 0}',
+          ) ??
+          0;
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم التصنيف',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'approvalThreshold',
+            label: 'حد طلب الاعتماد (ر.س)',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: (currentMinor / 100).toString(),
+            allowZero: true,
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'name': values['name']?.trim(),
+          'approvalThresholdMinor': _moneyMinor(values['approvalThreshold']),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/notification-templates':
+      return edit(
+        method: 'POST',
+        path: '/organizations/{organizationId}/notification-templates',
+        fields: [
+          WorkflowField(
+            name: 'body',
+            label: 'نص الرسالة',
+            type: WorkflowFieldType.textarea,
+            required: true,
+            initialValue: value('body'),
+          ),
+          WorkflowField(
+            name: 'variables',
+            label: 'المتغيرات المسموحة',
+            initialValue: _initialIds(row['allowedVariables']),
+          ),
+        ],
+        body: (values, controller) => {
+          'templateKey': row['templateKey'] ?? row['key'],
+          'language': row['language'] ?? 'ar',
+          'body': values['body'],
+          'allowedVariables': _selectedValues(values['variables']),
+        },
+      );
+  }
+  return null;
+}
+
+String _initialIds(dynamic value) {
+  if (value is! List) return value?.toString() ?? '';
+  return value
+      .map((item) {
+        if (item is Map) {
+          return (item['id'] ??
+                  item['mealId'] ??
+                  item['activityId'] ??
+                  item['code'] ??
+                  item['permissionCode'] ??
+                  '')
+              .toString();
+        }
+        return item.toString();
+      })
+      .where((item) => item.isNotEmpty)
+      .join(',');
 }
 
 MobileWorkflow _workflowById(String operationId) => mobileWorkflows
@@ -10919,15 +17962,61 @@ bool _canRunWorkflow(GoController controller, MobileWorkflow workflow) {
   final permission = <String, String>{
     'createSubscription': 'sales.checkout',
     'recordPayment': 'finance.payments.record',
+    'recordSplitPayment': 'finance.payments.record',
     'createCrmLead': 'crm.leads.manage',
     'recordExpense': 'finance.expenses.manage',
     'recordOtherIncome': 'finance.other-income.manage',
     'scheduleEmployeeShift': 'workforce.shifts.manage',
+    'recordEmployeeAttendance': 'workforce.attendance.record',
     'checkoutOrder': 'sales.checkout',
+    'checkoutServiceAtPos': 'sales.checkout',
+    'checkoutRetailAtPos': 'sales.checkout',
     'createManualReservation': 'bookings.create',
     'createEmployee': 'workforce.manage',
     'recordMeasurementSession': 'measurements.manage',
     'requestReportingRebuild': 'reporting.rebuild',
+    'createBranch': 'branch.manage',
+    'createActivity': 'catalog.manage',
+    'createServiceCategory': 'catalog.manage',
+    'createService': 'catalog.manage',
+    'createPackage': 'commercial.manage',
+    'createPrice': 'pricing.manage',
+    'createPromotion': 'promotions.manage',
+    'createCommercialPolicy': 'policies.manage',
+    'createCashPoint': 'finance.cash-points.manage',
+    'openCashierShift': 'finance.cash-shifts.manage',
+    'closeCashierShift': 'finance.cash-shifts.manage',
+    'createLocker': 'lockers.manage',
+    'createMeasurementType': 'measurement-types.manage',
+    'createPosition': 'workforce.manage',
+    'createFacility': 'bookings.facilities.manage',
+    'createBookableResource': 'bookings.facilities.manage',
+    'createRole': 'iam.roles.manage',
+    'createRoleAssignment': 'iam.assignments.manage',
+    'createNotificationTemplate': 'notification-templates.manage',
+    'createRetailCategory': 'retail.catalog.manage',
+    'createRetailProduct': 'retail.catalog.manage',
+    'createRetailPrice': 'retail.pricing.manage',
+    'adjustRetailStock': 'retail.inventory.manage',
+    'createExpenseCategory': 'finance.expenses.manage',
+    'createMealCategory': 'restaurant.catalog.manage',
+    'createRestaurantMeal': 'restaurant.catalog.manage',
+    'createRestaurantMealPrice': 'restaurant.pricing.manage',
+    'createDailyMenu': 'restaurant.menu.manage',
+    'issueAccessBarcode': 'access-credentials.manage',
+    'assignFingerprintPin': 'access-credentials.manage',
+    'registerAccessDevice': 'attendance.devices.manage',
+    'createCoachingSpecialty': 'coaching.manage',
+    'createTrainerProfile': 'coaching.manage',
+    'createOtherIncomeCategory': 'finance.other-income.manage',
+    'createCommunicationTemplate': 'notification-templates.manage',
+    'createCommunicationCampaign': 'notifications.send',
+    'createWhatsAppCampaign': 'notifications.whatsapp.manage',
+    'createCommissionPlan': 'coaching.commissions.manage',
+    'accrueTrainerCommission': 'coaching.commissions.manage',
+    'createTrainingPlanTemplate': 'coaching.training-plans.manage',
+    'createMemberTrainingPlan': 'coaching.training-plans.manage',
+    'createCrmLeadSource': 'crm.leads.manage',
   }[workflow.operationId];
   return permission == null || controller.can(permission);
 }
@@ -10956,6 +18045,7 @@ String? _featurePermission(String path) {
   if (path.contains('/other-income')) return 'finance.other-income.read';
   if (path.contains('/crm/leads')) return 'crm.leads.read';
   if (path.contains('/crm/follow-ups')) return 'crm.follow-ups.read';
+  if (path.contains('/daily-menus/')) return 'restaurant.menu.read';
   if (path.contains('/restaurant/')) return 'restaurant.catalog.read';
   if (path.contains('/retail/inventory')) return 'retail.inventory.read';
   if (path.contains('/retail/')) return 'retail.catalog.read';
