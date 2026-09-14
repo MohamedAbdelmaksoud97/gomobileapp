@@ -44,6 +44,7 @@ String riyadhBusinessDate() {
 }
 
 Map<String, String> resourceQueryFor(String path, String branchId) {
+  if (path == '/organizations/{organizationId}') return const {};
   if (path.endsWith('/crm/lead-sources')) return const {};
   if (path.endsWith('/daily-menu')) {
     return {'branchId': branchId, 'businessDate': riyadhBusinessDate()};
@@ -1653,6 +1654,19 @@ class ResourceFeature {
   final IconData icon;
   final List<(String, String)> fields;
 }
+
+const organizationFeature = ResourceFeature(
+  title: 'بيانات النادي',
+  subtitle: 'الاسم والرمز والمنطقة الزمنية وحالة النادي',
+  path: '/organizations/{organizationId}',
+  icon: Icons.business_outlined,
+  fields: [
+    ('nameAr', 'اسم النادي'),
+    ('code', 'الرمز'),
+    ('timezone', 'المنطقة الزمنية'),
+    ('status', 'الحالة'),
+  ],
+);
 
 const resourceFeatures = <ResourceFeature>[
   ResourceFeature(
@@ -7841,69 +7855,444 @@ List<Map<String, dynamic>> _demoResourceRows(ResourceFeature feature) =>
       },
     );
 
+ResourceFeature _featureEnding(String ending) =>
+    resourceFeatures.firstWhere((feature) => feature.path.endsWith(ending));
+
+List<ResourceFeature> _featuresEnding(Iterable<String> endings) =>
+    endings.map(_featureEnding).toList();
+
+class _MobileNavItem {
+  const _MobileNavItem({
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.onTap,
+  });
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final VoidCallback onTap;
+}
+
+class _MobileNavSection extends StatelessWidget {
+  const _MobileNavSection({
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.items,
+    this.initiallyExpanded = false,
+  });
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final List<_MobileNavItem> items;
+  final bool initiallyExpanded;
+
+  @override
+  Widget build(BuildContext context) {
+    if (items.isEmpty) return const SizedBox.shrink();
+    final colors = Theme.of(context).colorScheme;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 14),
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        initiallyExpanded: initiallyExpanded,
+        tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        childrenPadding: const EdgeInsets.only(bottom: 8),
+        leading: CircleAvatar(
+          backgroundColor: goYellow.withValues(alpha: .2),
+          child: Icon(icon, color: Colors.amber[800]),
+        ),
+        title: Text(
+          title,
+          style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16),
+        ),
+        subtitle: Padding(
+          padding: const EdgeInsets.only(top: 3),
+          child: Text(subtitle, style: const TextStyle(fontSize: 11)),
+        ),
+        children: [
+          Divider(height: 1, color: colors.outlineVariant),
+          ...items.indexed.map(
+            (entry) => Column(
+              children: [
+                ListTile(
+                  onTap: entry.$2.onTap,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 18,
+                    vertical: 3,
+                  ),
+                  leading: Icon(entry.$2.icon, color: colors.onSurfaceVariant),
+                  title: Text(
+                    entry.$2.title,
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: Text(
+                    entry.$2.subtitle,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11, height: 1.45),
+                  ),
+                  trailing: const Icon(Icons.chevron_left_rounded),
+                ),
+                if (entry.$1 < items.length - 1)
+                  Divider(height: 1, indent: 58, color: colors.outlineVariant),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class MorePage extends StatelessWidget {
   const MorePage({super.key, required this.controller});
   final GoController controller;
+
+  void _push(BuildContext context, Widget page) =>
+      Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => page));
+
+  void _resource(BuildContext context, String ending) =>
+      _openResource(context, controller, _featureEnding(ending));
+
+  void _hub(
+    BuildContext context, {
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required List<String> endings,
+  }) {
+    _push(
+      context,
+      FeatureHubPage(
+        controller: controller,
+        title: title,
+        subtitle: subtitle,
+        icon: icon,
+        features: _featuresEnding(endings),
+      ),
+    );
+  }
+
+  bool _can(String ending) =>
+      _canViewFeature(controller, _featureEnding(ending));
+
+  bool _canAny(Iterable<String> endings) => endings.any(_can);
+
   @override
   Widget build(BuildContext context) {
+    const pos = ['/orders', '/invoices', '/payments', '/cashier-shifts'];
+    const finance = [
+      '/invoices',
+      '/payments',
+      '/refunds',
+      '/refund-requests',
+      '/expenses',
+      '/other-income',
+      '/trainer-commissions',
+      '/trainer-commission-plans',
+    ];
+    const crm = [
+      '/crm/leads',
+      '/crm/follow-ups',
+      '/crm/lead-sources',
+      '/online-requests',
+    ];
+    const communications = [
+      '/notifications',
+      '/notification-templates',
+      '/whatsapp-campaigns',
+      '/communication-templates',
+      '/communication-campaigns',
+    ];
+    const restaurant = [
+      '/restaurant-orders',
+      '/restaurant/meal-categories',
+      '/restaurant/meals',
+      '/restaurant/meal-prices',
+    ];
+    const trainer = [
+      '/trainers',
+      '/coaching-specialties',
+      '/measurement-sessions',
+      '/measurement-types',
+      '/trainer-commissions',
+      '/trainer-commission-plans',
+      '/training-plan-templates',
+      '/member-training-plans',
+    ];
+    const staff = [
+      '/employees',
+      '/employee-shifts',
+      '/employee-attendance',
+      '/positions',
+    ];
+
+    final clubItems = <_MobileNavItem>[
+      if (controller.can('members.read'))
+        _MobileNavItem(
+          title: 'الأعضاء',
+          subtitle: 'دليل الأعضاء وملفاتهم وحالة عضويتهم',
+          icon: Icons.people_alt_outlined,
+          onTap: () => controller.setTab(1),
+        ),
+      if (_can('/subscriptions'))
+        _MobileNavItem(
+          title: 'الاشتراكات',
+          subtitle: 'دورة الاشتراك والتجميد والتجديد',
+          icon: Icons.credit_card_outlined,
+          onTap: () => _resource(context, '/subscriptions'),
+        ),
+      if (_can('/attendance-attempts'))
+        _MobileNavItem(
+          title: 'الحضور والدخول',
+          subtitle: 'محاولات الدخول المقبولة والمرفوضة',
+          icon: Icons.how_to_reg_outlined,
+          onTap: () => _resource(context, '/attendance-attempts'),
+        ),
+      if (_can('/access-devices') || _can('/access-device-events'))
+        _MobileNavItem(
+          title: 'البوابات والبصمة',
+          subtitle: 'حالة اللوحات وسجل أحداث كل بوابة في مكان واحد',
+          icon: Icons.fingerprint_rounded,
+          onTap: () =>
+              _push(context, AccessControlMobilePage(controller: controller)),
+        ),
+      if (_can('/reservations'))
+        _MobileNavItem(
+          title: 'الحجوزات',
+          subtitle: 'المواعيد والموارد المحجوزة',
+          icon: Icons.calendar_month_outlined,
+          onTap: () => _resource(context, '/reservations'),
+        ),
+      if (_can('/access-credentials'))
+        _MobileNavItem(
+          title: 'الباركود والطباعة',
+          subtitle: 'بطاقات وبيانات الدخول المرتبطة بالأعضاء',
+          icon: Icons.qr_code_2_rounded,
+          onTap: () => _resource(context, '/access-credentials'),
+        ),
+      if (_can('/files'))
+        _MobileNavItem(
+          title: 'الملفات',
+          subtitle: 'مرفقات الأعضاء والموظفين الآمنة',
+          icon: Icons.folder_copy_outlined,
+          onTap: () => _resource(context, '/files'),
+        ),
+    ];
+
+    final businessItems = <_MobileNavItem>[
+      if (_canAny(pos))
+        _MobileNavItem(
+          title: 'نقطة البيع',
+          subtitle: 'الطلبات والفواتير والتحصيل ووردية الصندوق',
+          icon: Icons.point_of_sale_outlined,
+          onTap: () => _hub(
+            context,
+            title: 'نقطة البيع',
+            subtitle: 'مسار البيع والتحصيل كاملًا داخل الفرع الحالي.',
+            icon: Icons.point_of_sale_outlined,
+            endings: pos,
+          ),
+        ),
+      if (_canAny(finance))
+        _MobileNavItem(
+          title: 'المالية والعمولات',
+          subtitle: 'الخزنة والمصروفات والاستردادات وعمولات المدربين',
+          icon: Icons.account_balance_wallet_outlined,
+          onTap: () => _hub(
+            context,
+            title: 'المالية والعمولات',
+            subtitle: 'رؤية مالية موحدة من الفاتورة حتى المصروف والعمولة.',
+            icon: Icons.account_balance_wallet_outlined,
+            endings: finance,
+          ),
+        ),
+      if (_can('/cashier-shifts'))
+        _MobileNavItem(
+          title: 'سجل ورديات الصندوق',
+          subtitle: 'مراجعة الورديات المفتوحة والمغلقة',
+          icon: Icons.history_rounded,
+          onTap: () => _resource(context, '/cashier-shifts'),
+        ),
+      if (_canAny(crm))
+        _MobileNavItem(
+          title: 'العملاء والمتابعات',
+          subtitle: 'العملاء المحتملون والطلبات والمتابعات القادمة',
+          icon: Icons.bolt_outlined,
+          onTap: () => _hub(
+            context,
+            title: 'العملاء والمتابعات',
+            subtitle: 'كل رحلة العميل المحتمل والمتابعة في مساحة واحدة.',
+            icon: Icons.bolt_outlined,
+            endings: crm,
+          ),
+        ),
+      if (_canAny(communications))
+        _MobileNavItem(
+          title: 'الرسائل والتواصل',
+          subtitle: 'القوالب والحملات وسجل تسليم الرسائل',
+          icon: Icons.forum_outlined,
+          onTap: () => _hub(
+            context,
+            title: 'الرسائل والتواصل',
+            subtitle: 'إدارة قنوات التواصل والقوالب والحملات.',
+            icon: Icons.forum_outlined,
+            endings: communications,
+          ),
+        ),
+      if (controller.can('workforce.shifts.read') ||
+          controller.can('attendance.read') ||
+          controller.can('restaurant.orders.read'))
+        _MobileNavItem(
+          title: 'مركز العمليات',
+          subtitle: 'المناوبات والحضور والطلبات اليومية',
+          icon: Icons.assignment_outlined,
+          onTap: () => controller.setTab(2),
+        ),
+      if (_can('/feedback-cases'))
+        _MobileNavItem(
+          title: 'الشكاوى والاقتراحات',
+          subtitle: 'متابعة المحادثات حتى الإغلاق',
+          icon: Icons.feedback_outlined,
+          onTap: () => _resource(context, '/feedback-cases'),
+        ),
+      if (_canAny(restaurant))
+        _MobileNavItem(
+          title: 'المطعم',
+          subtitle: 'الطلبات والوجبات والتصنيفات والأسعار',
+          icon: Icons.restaurant_outlined,
+          onTap: () => _hub(
+            context,
+            title: 'المطعم',
+            subtitle: 'التشغيل اليومي وكتالوج المطعم وأسعاره.',
+            icon: Icons.restaurant_outlined,
+            endings: restaurant,
+          ),
+        ),
+      if (_canAny(trainer))
+        _MobileNavItem(
+          title: 'التدريب والمدربون',
+          subtitle: 'المدربون والخطط والقياسات والعمولات',
+          icon: Icons.fitness_center_outlined,
+          onTap: () => _hub(
+            context,
+            title: 'التدريب والمدربون',
+            subtitle: 'إدارة التدريب من التخصص والقياس إلى الخطة والعمولة.',
+            icon: Icons.fitness_center_outlined,
+            endings: trainer,
+          ),
+        ),
+      if (_canAny(staff))
+        _MobileNavItem(
+          title: 'الموظفون',
+          subtitle: 'الفريق والمناوبات والدوام والمسميات',
+          icon: Icons.badge_outlined,
+          onTap: () => _hub(
+            context,
+            title: 'الموظفون',
+            subtitle: 'بيانات الفريق وتشغيله اليومي في مكان واحد.',
+            icon: Icons.badge_outlined,
+            endings: staff,
+          ),
+        ),
+    ];
+
+    final adminItems = <_MobileNavItem>[
+      if (controller.can('reporting.read'))
+        _MobileNavItem(
+          title: 'التقارير',
+          subtitle: 'الإيرادات والحضور والاشتراكات وأداء التشغيل',
+          icon: Icons.analytics_outlined,
+          onTap: () => _push(context, ReportsPage(controller: controller)),
+        ),
+      if (_can('/audit-records'))
+        _MobileNavItem(
+          title: 'سجل نشاط النظام',
+          subtitle: 'التغييرات والإجراءات المدققة',
+          icon: Icons.history_toggle_off_rounded,
+          onTap: () => _resource(context, '/audit-records'),
+        ),
+      if (SystemSettingsPage.hasVisibleSettings(controller))
+        _MobileNavItem(
+          title: 'إعداد النظام',
+          subtitle: 'بيانات النادي والفروع والتسعير والصلاحيات وكل الإعدادات',
+          icon: Icons.settings_outlined,
+          onTap: () =>
+              _push(context, SystemSettingsPage(controller: controller)),
+        ),
+    ];
+
     return PageFrame(
-      title: 'كل مساحة GO',
-      subtitle: 'أدوات النظام كاملة، مصممة لتعمل معك أينما كنت.',
+      title: 'أقسام النظام',
+      subtitle:
+          'تنقل منظم مطابق لنسخة الويب، مع إظهار ما تسمح به صلاحياتك فقط.',
       child: Column(
         children: [
           Card(
-            child: Padding(
-              padding: const EdgeInsets.all(18),
-              child: Row(
-                children: [
-                  const CircleAvatar(
-                    radius: 28,
-                    backgroundColor: goYellow,
-                    child: Icon(Icons.person, color: goInk, size: 30),
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          controller.displayName,
-                          style: TextStyle(
-                            fontWeight: FontWeight.w900,
-                            fontSize: 16,
-                          ),
-                        ),
-                        const SizedBox(height: 3),
-                        Text(
-                          '${controller.branchName}  •  حساب موظف',
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: controller.logout,
-                    icon: const Icon(Icons.logout_rounded),
-                    tooltip: 'تسجيل الخروج',
-                  ),
-                ],
+            margin: const EdgeInsets.only(bottom: 14),
+            child: ListTile(
+              contentPadding: const EdgeInsets.all(14),
+              leading: const CircleAvatar(
+                radius: 25,
+                backgroundColor: goYellow,
+                child: Icon(Icons.person, color: goInk),
+              ),
+              title: Text(
+                controller.displayName,
+                style: const TextStyle(fontWeight: FontWeight.w900),
+              ),
+              subtitle: Text('${controller.branchName} • حساب موظف'),
+              trailing: IconButton(
+                onPressed: () =>
+                    _push(context, AccountPage(controller: controller)),
+                icon: const Icon(Icons.manage_accounts_outlined),
+                tooltip: 'إعدادات حسابي',
               ),
             ),
           ),
-          const SizedBox(height: 16),
+          _MobileNavSection(
+            title: 'إدارة النادي',
+            subtitle: 'الأعضاء والاشتراكات والدخول والحجوزات',
+            icon: Icons.apartment_rounded,
+            items: clubItems,
+            initiallyExpanded: true,
+          ),
+          _MobileNavSection(
+            title: 'الأعمال',
+            subtitle: 'البيع والمالية والتشغيل والتواصل',
+            icon: Icons.workspaces_outline,
+            items: businessItems,
+          ),
+          _MobileNavSection(
+            title: 'الإدارة',
+            subtitle: 'التقارير والتدقيق وإعداد النظام',
+            icon: Icons.admin_panel_settings_outlined,
+            items: adminItems,
+          ),
           Card(
             child: Column(
               children: [
                 ListTile(
-                  onTap: () => Navigator.of(context).push(
-                    MaterialPageRoute<void>(
-                      builder: (_) => AccountPage(controller: controller),
-                    ),
+                  onTap: () =>
+                      _push(context, WorkflowHubPage(controller: controller)),
+                  leading: const Icon(Icons.bolt_rounded),
+                  title: const Text(
+                    'الإجراءات الأساسية',
+                    style: TextStyle(fontWeight: FontWeight.w800),
                   ),
-                  leading: const Icon(Icons.manage_accounts_outlined),
-                  title: const Text('إعدادات حسابي'),
+                  subtitle: const Text('إنشاء وتحصيل وحجز من نماذج الموبايل'),
+                  trailing: const Icon(Icons.chevron_left_rounded),
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  onTap: () =>
+                      _push(context, ApiOperationsPage(controller: controller)),
+                  leading: const Icon(Icons.hub_outlined),
+                  title: const Text('العمليات المتقدمة'),
                   subtitle: const Text(
-                    'الاسم واللغة والتوقيت والتنبيهات وكلمة المرور',
+                    'كل عمليات API الموثقة للحالات المتخصصة',
                   ),
                   trailing: const Icon(Icons.chevron_left_rounded),
                 ),
@@ -7912,147 +8301,968 @@ class MorePage extends StatelessWidget {
                   ListTile(
                     onTap: () => _openContextSheet(context, controller),
                     leading: const Icon(Icons.location_on_outlined),
-                    title: const Text('المؤسسة والفرع'),
+                    title: const Text('تغيير المؤسسة أو الفرع'),
                     subtitle: Text(controller.branchName),
                     trailing: const Icon(Icons.chevron_left_rounded),
                   ),
                 ],
-                const Divider(height: 1),
-                SwitchListTile(
-                  value: controller.darkMode,
-                  onChanged: (_) => controller.toggleTheme(),
-                  secondary: Icon(
-                    controller.darkMode
-                        ? Icons.dark_mode_outlined
-                        : Icons.light_mode_outlined,
-                  ),
-                  title: const Text('المظهر الداكن'),
-                  subtitle: const Text('يتبع اختيارك داخل التطبيق'),
-                ),
               ],
             ),
-          ),
-          const SizedBox(height: 12),
-          Card(
-            child: ListTile(
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => WorkflowHubPage(controller: controller),
-                ),
-              ),
-              leading: const CircleAvatar(
-                backgroundColor: goInk,
-                child: Icon(Icons.bolt_rounded, color: goYellow),
-              ),
-              title: const Text(
-                'الإجراءات الأساسية',
-                style: TextStyle(fontWeight: FontWeight.w900),
-              ),
-              subtitle: const Text(
-                'إنشاء وتحصيل وحجز وتشغيل من نماذج مهيأة للموبايل',
-              ),
-              trailing: const Icon(Icons.chevron_left_rounded),
-            ),
-          ),
-          if (controller.can('reporting.read')) const SizedBox(height: 12),
-          if (controller.can('reporting.read'))
-            Card(
-              clipBehavior: Clip.antiAlias,
-              child: ListTile(
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) => ReportsPage(controller: controller),
-                  ),
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 18,
-                  vertical: 8,
-                ),
-                leading: const CircleAvatar(
-                  backgroundColor: goYellow,
-                  child: Icon(Icons.analytics_outlined, color: goInk),
-                ),
-                title: const Text(
-                  'التقارير ولوحات التحليل',
-                  style: TextStyle(fontWeight: FontWeight.w900),
-                ),
-                subtitle: const Text(
-                  'الإيرادات والحضور والاشتراكات والديون وأداء الباقات',
-                ),
-                trailing: const Icon(
-                  Icons.arrow_back_ios_new_rounded,
-                  size: 16,
-                ),
-              ),
-            ),
-          const SizedBox(height: 12),
-          Card(
-            clipBehavior: Clip.antiAlias,
-            child: ListTile(
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (_) => ApiOperationsPage(controller: controller),
-                ),
-              ),
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 18,
-                vertical: 10,
-              ),
-              leading: const CircleAvatar(
-                backgroundColor: goInk,
-                child: Icon(Icons.hub_outlined, color: goYellow),
-              ),
-              title: const Text(
-                'مركز كل عمليات النظام',
-                style: TextStyle(fontWeight: FontWeight.w900),
-              ),
-              subtitle: const Text(
-                'وصول موحد إلى كل عمليات API الموثقة، بما فيها الإجراءات المتقدمة.',
-              ),
-              trailing: const Icon(Icons.arrow_back_ios_new_rounded, size: 16),
-            ),
-          ),
-          const SizedBox(height: 12),
-          GridView.count(
-            crossAxisCount: MediaQuery.sizeOf(context).width > 600 ? 4 : 2,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            crossAxisSpacing: 10,
-            mainAxisSpacing: 10,
-            childAspectRatio: 1.35,
-            children: resourceFeatures
-                .where((feature) => _canViewFeature(controller, feature))
-                .map(
-                  (f) => Card(
-                    child: InkWell(
-                      onTap: () => _openResource(context, controller, f),
-                      borderRadius: BorderRadius.circular(12),
-                      child: Padding(
-                        padding: const EdgeInsets.all(13),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Icon(f.icon, color: Colors.amber[800]),
-                            Text(
-                              f.title,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w800,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                )
-                .toList(),
           ),
         ],
       ),
     );
   }
+}
+
+class FeatureHubPage extends StatelessWidget {
+  const FeatureHubPage({
+    super.key,
+    required this.controller,
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.features,
+  });
+  final GoController controller;
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final List<ResourceFeature> features;
+
+  @override
+  Widget build(BuildContext context) {
+    final allowed = features
+        .where((feature) => _canViewFeature(controller, feature))
+        .toList();
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title, style: const TextStyle(fontWeight: FontWeight.w900)),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(18, 14, 18, 30),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: goYellow.withValues(alpha: .13),
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: goYellow.withValues(alpha: .45)),
+            ),
+            child: Row(
+              children: [
+                CircleAvatar(
+                  radius: 25,
+                  backgroundColor: goInk,
+                  child: Icon(icon, color: goYellow),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Text(subtitle, style: const TextStyle(height: 1.6)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          ...allowed.map(
+            (feature) => Card(
+              margin: const EdgeInsets.only(bottom: 9),
+              child: ListTile(
+                onTap: () => _openResource(context, controller, feature),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 7,
+                ),
+                leading: CircleAvatar(
+                  backgroundColor: goYellow.withValues(alpha: .16),
+                  child: Icon(feature.icon, color: Colors.amber[800]),
+                ),
+                title: Text(
+                  feature.title,
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+                subtitle: Text(feature.subtitle),
+                trailing: const Icon(Icons.chevron_left_rounded),
+              ),
+            ),
+          ),
+          if (allowed.isEmpty)
+            const _ResourceMessage(
+              icon: Icons.lock_outline_rounded,
+              title: 'لا توجد أدوات متاحة',
+              body: 'صلاحيات حسابك لا تتيح أدوات داخل هذا القسم.',
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SettingsGroup {
+  const _SettingsGroup(this.title, this.icon, this.features);
+  final String title;
+  final IconData icon;
+  final List<ResourceFeature> features;
+}
+
+class SystemSettingsPage extends StatefulWidget {
+  const SystemSettingsPage({super.key, required this.controller});
+  final GoController controller;
+
+  static List<_SettingsGroup> _groups() => [
+    _SettingsGroup('النادي والموظفون', Icons.apartment_outlined, [
+      organizationFeature,
+      _featureEnding('/branches'),
+      _featureEnding('/positions'),
+      _featureEnding('/user-accounts'),
+    ]),
+    _SettingsGroup('الصلاحيات الإضافية', Icons.shield_outlined, [
+      _featureEnding('/roles'),
+      _featureEnding('/role-assignments'),
+    ]),
+    _SettingsGroup('الخدمات والتسعير', Icons.sell_outlined, [
+      _featureEnding('/activities'),
+      _featureEnding('/service-categories'),
+      _featureEnding('/services'),
+      _featureEnding('/packages'),
+      _featureEnding('/prices'),
+      _featureEnding('/promotions'),
+      _featureEnding('/commercial-policies'),
+    ]),
+    _SettingsGroup('المرافق والتشغيل', Icons.domain_outlined, [
+      _featureEnding('/facilities'),
+      _featureEnding('/bookable-resources'),
+      _featureEnding('/cash-points'),
+      _featureEnding('/lockers'),
+    ]),
+    _SettingsGroup('التدريب', Icons.fitness_center_outlined, [
+      _featureEnding('/measurement-types'),
+    ]),
+    _SettingsGroup('المطعم', Icons.restaurant_menu_outlined, [
+      _featureEnding('/restaurant/meal-categories'),
+    ]),
+    _SettingsGroup('المتجر والمخزون', Icons.inventory_2_outlined, [
+      _featureEnding('/retail/categories'),
+      _featureEnding('/retail/products'),
+      _featureEnding('/retail/prices'),
+      _featureEnding('/retail/inventory'),
+    ]),
+    _SettingsGroup('المالية', Icons.account_balance_outlined, [
+      _featureEnding('/expense-categories'),
+    ]),
+    _SettingsGroup('التواصل', Icons.mark_email_read_outlined, [
+      _featureEnding('/notification-templates'),
+    ]),
+  ];
+
+  static bool hasVisibleSettings(GoController controller) => _groups().any(
+    (group) =>
+        group.features.any((feature) => _canViewFeature(controller, feature)),
+  );
+
+  @override
+  State<SystemSettingsPage> createState() => _SystemSettingsPageState();
+}
+
+class _SystemSettingsPageState extends State<SystemSettingsPage> {
+  String query = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final groups = SystemSettingsPage._groups()
+        .map(
+          (group) => _SettingsGroup(
+            group.title,
+            group.icon,
+            group.features.where((feature) {
+              if (!_canViewFeature(widget.controller, feature)) return false;
+              final needle = query.trim().toLowerCase();
+              return needle.isEmpty ||
+                  feature.title.toLowerCase().contains(needle) ||
+                  feature.subtitle.toLowerCase().contains(needle) ||
+                  group.title.toLowerCase().contains(needle);
+            }).toList(),
+          ),
+        )
+        .where((group) => group.features.isNotEmpty)
+        .toList();
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'إعداد النظام',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(18, 12, 18, 30),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: goYellow.withValues(alpha: .12),
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: goYellow.withValues(alpha: .45)),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                CircleAvatar(
+                  backgroundColor: goInk,
+                  child: Icon(Icons.settings_suggest_outlined, color: goYellow),
+                ),
+                SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'مركز إعداد موحّد',
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'بيانات النادي والفروع والكتالوج والأسعار والمسميات والصلاحيات من مكان واحد.',
+                        style: TextStyle(fontSize: 12, height: 1.6),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          TextField(
+            onChanged: (value) => setState(() => query = value),
+            decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.search_rounded),
+              hintText: 'ابحث داخل إعداد النظام…',
+            ),
+          ),
+          const SizedBox(height: 14),
+          ...groups.map(
+            (group) => Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              clipBehavior: Clip.antiAlias,
+              child: ExpansionTile(
+                initiallyExpanded: query.isNotEmpty || groups.length < 4,
+                leading: Icon(group.icon, color: Colors.amber[800]),
+                title: Text(
+                  group.title,
+                  style: const TextStyle(fontWeight: FontWeight.w900),
+                ),
+                subtitle: Text('${group.features.length} إعدادات'),
+                children: group.features.indexed
+                    .map(
+                      (entry) => Column(
+                        children: [
+                          if (entry.$1 == 0) const Divider(height: 1),
+                          ListTile(
+                            onTap: () => _openResource(
+                              context,
+                              widget.controller,
+                              entry.$2,
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 18,
+                              vertical: 4,
+                            ),
+                            leading: Icon(entry.$2.icon, size: 21),
+                            title: Text(
+                              entry.$2.title,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            subtitle: Text(
+                              entry.$2.subtitle,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 11),
+                            ),
+                            trailing: const Icon(Icons.chevron_left_rounded),
+                          ),
+                        ],
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
+          ),
+          if (groups.isEmpty)
+            const _ResourceMessage(
+              icon: Icons.search_off_rounded,
+              title: 'لا توجد إعدادات مطابقة',
+              body: 'غيّر عبارة البحث أو راجع صلاحيات حسابك.',
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class AccessControlMobilePage extends StatefulWidget {
+  const AccessControlMobilePage({super.key, required this.controller});
+  final GoController controller;
+
+  @override
+  State<AccessControlMobilePage> createState() =>
+      _AccessControlMobilePageState();
+}
+
+class _AccessControlMobilePageState extends State<AccessControlMobilePage> {
+  List<Map<String, dynamic>> devices = [];
+  List<Map<String, dynamic>> events = [];
+  bool loading = true;
+  String? deviceError;
+  String? eventError;
+  String view = 'devices';
+  String? selectedDeviceId;
+  Timer? refreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(load());
+    if (widget.controller.api.configured) {
+      refreshTimer = Timer.periodic(
+        const Duration(seconds: 15),
+        (_) => unawaited(load(silent: true)),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    refreshTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> load({bool silent = false}) async {
+    if (!silent && mounted) setState(() => loading = true);
+    if (!widget.controller.api.configured) {
+      final now = DateTime.now();
+      devices = [
+        {
+          'id': 'demo-gate',
+          'name': 'بوابة الفرع الرئيسية',
+          'serialNumber': 'BRI3232060149',
+          'model': 'ZKTeco ACP-260',
+          'mode': 'ENFORCE',
+          'status': 'ACTIVE',
+          'ipAddress': '192.168.1.201',
+          'doorCount': 2,
+          'readerCount': 4,
+          'lastSeenAt': now
+              .subtract(const Duration(seconds: 24))
+              .toIso8601String(),
+          'lastEventAt': now
+              .subtract(const Duration(minutes: 3))
+              .toIso8601String(),
+        },
+      ];
+      events = [
+        {
+          'id': 'event-1',
+          'deviceId': 'demo-gate',
+          'deviceName': 'بوابة الفرع الرئيسية',
+          'deviceOccurredAt': now
+              .subtract(const Duration(minutes: 3))
+              .toIso8601String(),
+          'memberName': 'أحمد محمد',
+          'memberNumber': 'GO-10482',
+          'credentialPin': '22782',
+          'doorNumber': 1,
+          'direction': 'IN',
+          'deviceDecision': 'ALLOWED',
+          'processingStatus': 'ATTENDANCE_RECORDED',
+          'processingCode': 'SYSTEM_ACCEPTED',
+        },
+        {
+          'id': 'event-2',
+          'deviceId': 'demo-gate',
+          'deviceName': 'بوابة الفرع الرئيسية',
+          'deviceOccurredAt': now
+              .subtract(const Duration(minutes: 17))
+              .toIso8601String(),
+          'employeeName': 'محمد خالد',
+          'employeeNumber': 'EMP-018',
+          'credentialPin': '1818',
+          'doorNumber': 2,
+          'direction': 'OUT',
+          'deviceDecision': 'ALLOWED',
+          'processingStatus': 'ATTENDANCE_RECORDED',
+          'processingCode': 'EMPLOYEE_CLOCK_OUT_RECORDED',
+        },
+        {
+          'id': 'event-3',
+          'deviceId': 'demo-gate',
+          'deviceName': 'بوابة الفرع الرئيسية',
+          'deviceOccurredAt': now
+              .subtract(const Duration(minutes: 28))
+              .toIso8601String(),
+          'credentialPin': '99102',
+          'doorNumber': 1,
+          'direction': 'IN',
+          'deviceDecision': 'ALLOWED',
+          'processingStatus': 'UNMAPPED_CREDENTIAL',
+        },
+      ];
+      deviceError = null;
+      eventError = null;
+      if (mounted) setState(() => loading = false);
+      return;
+    }
+
+    final api = widget.controller.api;
+    final org = widget.controller.organizationId;
+    final branch = widget.controller.branchId;
+    await Future.wait<void>([
+      () async {
+        try {
+          devices = await api.listResource(
+            org,
+            branch,
+            '/organizations/{organizationId}/access-devices',
+          );
+          deviceError = null;
+        } catch (exception) {
+          deviceError = _errorMessage(exception);
+        }
+      }(),
+      () async {
+        try {
+          events = await api.listResource(
+            org,
+            branch,
+            '/organizations/{organizationId}/access-device-events',
+          );
+          eventError = null;
+        } catch (exception) {
+          eventError = _errorMessage(exception);
+        }
+      }(),
+    ]);
+    if (mounted) setState(() => loading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleEvents = selectedDeviceId == null
+        ? events
+        : events
+              .where(
+                (event) => event['deviceId']?.toString() == selectedDeviceId,
+              )
+              .toList();
+    final online = devices.where(_gateIsOnline).length;
+    final accepted = events.where(_gateAccepted).length;
+    final review = events.where(_gateNeedsReview).length;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'البوابات والبصمة',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+        actions: [
+          if (_canViewFeature(
+            widget.controller,
+            _featureEnding('/access-credentials'),
+          ))
+            IconButton(
+              onPressed: () => _openResource(
+                context,
+                widget.controller,
+                _featureEnding('/access-credentials'),
+              ),
+              icon: const Icon(Icons.key_outlined),
+              tooltip: 'بطاقات وPIN الدخول',
+            ),
+          IconButton(
+            onPressed: loading ? null : load,
+            icon: const Icon(Icons.refresh_rounded),
+            tooltip: 'تحديث',
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: load,
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(18, 12, 18, 30),
+          children: [
+            Container(
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(
+                color: goYellow.withValues(alpha: .12),
+                borderRadius: BorderRadius.circular(22),
+                border: Border.all(color: goYellow.withValues(alpha: .45)),
+              ),
+              child: const Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  CircleAvatar(
+                    backgroundColor: goInk,
+                    child: Icon(Icons.fingerprint_rounded, color: goYellow),
+                  ),
+                  SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'مراقبة لحظية للبوابة',
+                          style: TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                        SizedBox(height: 4),
+                        Text(
+                          'حالة اللوحات وأحداث الدخول والخروج وقرار GO داخل سياق واحد.',
+                          style: TextStyle(fontSize: 12, height: 1.6),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final width = constraints.maxWidth > 620
+                    ? (constraints.maxWidth - 24) / 3
+                    : (constraints.maxWidth - 12) / 2;
+                return Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  children: [
+                    _GateMetric(
+                      width: width,
+                      icon: Icons.sensors_rounded,
+                      label: 'اللوحات المتصلة',
+                      value: '$online / ${devices.length}',
+                      color: Colors.green,
+                    ),
+                    _GateMetric(
+                      width: width,
+                      icon: Icons.verified_user_outlined,
+                      label: 'أحداث مقبولة',
+                      value: '$accepted',
+                      color: Colors.blue,
+                    ),
+                    _GateMetric(
+                      width: width,
+                      icon: Icons.rule_folder_outlined,
+                      label: 'تحتاج مراجعة',
+                      value: '$review',
+                      color: Colors.orange,
+                    ),
+                  ],
+                );
+              },
+            ),
+            const SizedBox(height: 16),
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(
+                  value: 'devices',
+                  label: Text('اللوحات'),
+                  icon: Icon(Icons.sensors_outlined),
+                ),
+                ButtonSegment(
+                  value: 'events',
+                  label: Text('سجل المرور'),
+                  icon: Icon(Icons.history_rounded),
+                ),
+              ],
+              selected: {view},
+              onSelectionChanged: (selected) =>
+                  setState(() => view = selected.first),
+            ),
+            const SizedBox(height: 14),
+            if (loading && devices.isEmpty && events.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(60),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (view == 'devices') ...[
+              if (deviceError != null)
+                _InlineError(message: deviceError!, onRetry: load),
+              if (devices.isEmpty && deviceError == null)
+                const _ResourceMessage(
+                  icon: Icons.sensors_off_outlined,
+                  title: 'لا توجد لوحة مسجلة',
+                  body: 'لم تُسجّل لوحة دخول لهذا الفرع بعد.',
+                ),
+              ...devices.map(
+                (device) => _GateDeviceCard(
+                  device: device,
+                  selected: selectedDeviceId == device['id']?.toString(),
+                  onEvents: () => setState(() {
+                    selectedDeviceId = device['id']?.toString();
+                    view = 'events';
+                  }),
+                ),
+              ),
+            ] else ...[
+              if (eventError != null)
+                _InlineError(message: eventError!, onRetry: load),
+              if (devices.length > 1)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: DropdownButtonFormField<String>(
+                    initialValue: selectedDeviceId ?? '',
+                    decoration: const InputDecoration(
+                      labelText: 'تصفية حسب البوابة',
+                      prefixIcon: Icon(Icons.filter_alt_outlined),
+                    ),
+                    items: [
+                      const DropdownMenuItem(
+                        value: '',
+                        child: Text('كل البوابات'),
+                      ),
+                      ...devices.map(
+                        (device) => DropdownMenuItem(
+                          value: device['id']?.toString() ?? '',
+                          child: Text(device['name']?.toString() ?? 'بوابة'),
+                        ),
+                      ),
+                    ],
+                    onChanged: (value) => setState(
+                      () => selectedDeviceId = value?.isEmpty == true
+                          ? null
+                          : value,
+                    ),
+                  ),
+                ),
+              if (visibleEvents.isEmpty && eventError == null)
+                const _ResourceMessage(
+                  icon: Icons.history_toggle_off_rounded,
+                  title: 'لا توجد أحداث بعد',
+                  body: 'ستظهر محاولات الدخول والخروج فور وصولها من البوابة.',
+                ),
+              ...visibleEvents.map((event) => _GateEventCard(event: event)),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GateMetric extends StatelessWidget {
+  const _GateMetric({
+    required this.width,
+    required this.icon,
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+  final double width;
+  final IconData icon;
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: width,
+    child: Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: color),
+            const SizedBox(height: 10),
+            Text(
+              value,
+              style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w900),
+            ),
+            Text(label, style: const TextStyle(fontSize: 10)),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+class _GateDeviceCard extends StatelessWidget {
+  const _GateDeviceCard({
+    required this.device,
+    required this.selected,
+    required this.onEvents,
+  });
+  final Map<String, dynamic> device;
+  final bool selected;
+  final VoidCallback onEvents;
+
+  @override
+  Widget build(BuildContext context) {
+    final online = _gateIsOnline(device);
+    final mode = device['mode']?.toString();
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  backgroundColor: (online ? Colors.green : Colors.red)
+                      .withValues(alpha: .12),
+                  child: Icon(
+                    online ? Icons.sensors_rounded : Icons.sensors_off_outlined,
+                    color: online ? Colors.green : Colors.red,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        device['name']?.toString() ?? 'لوحة بوابة',
+                        style: const TextStyle(fontWeight: FontWeight.w900),
+                      ),
+                      Text(
+                        '${device['model'] ?? 'ZKTeco'} • ${device['serialNumber'] ?? '—'}',
+                        textDirection: TextDirection.ltr,
+                        textAlign: TextAlign.right,
+                        style: const TextStyle(fontSize: 10),
+                      ),
+                    ],
+                  ),
+                ),
+                _GatePill(
+                  text: online ? 'متصل' : 'غير متصل',
+                  color: online ? Colors.green : Colors.red,
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _GatePill(
+                  text: mode == 'ENFORCE' ? 'وضع التنفيذ' : 'وضع المراقبة',
+                  color: mode == 'ENFORCE' ? Colors.orange : Colors.blueGrey,
+                ),
+                _GatePill(
+                  text:
+                      '${device['doorCount'] ?? '—'} مخارج • ${device['readerCount'] ?? '—'} قارئات',
+                  color: Colors.blueGrey,
+                ),
+              ],
+            ),
+            const SizedBox(height: 13),
+            Text(
+              'آخر اتصال: ${_displayValue('lastSeenAt', device['lastSeenAt'])}\nآخر حدث: ${_displayValue('lastEventAt', device['lastEventAt'])}',
+              style: const TextStyle(fontSize: 11, height: 1.7),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: onEvents,
+              icon: const Icon(Icons.history_rounded),
+              label: Text(
+                selected ? 'عرض السجل المحدد' : 'عرض أحداث هذه البوابة',
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GateEventCard extends StatelessWidget {
+  const _GateEventCard({required this.event});
+  final Map<String, dynamic> event;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _gateEventColor(event);
+    final rejectedAfterOpen =
+        event['deviceDecision']?.toString() == 'ALLOWED' &&
+        (event['processingCode']?.toString().startsWith('SYSTEM_REJECTED_') ??
+            false);
+    final subject =
+        event['memberName'] ??
+        event['employeeName'] ??
+        (event['credentialPin'] == null
+            ? 'شخص غير معروف'
+            : 'PIN ${event['credentialPin']}');
+    final number = event['memberNumber'] ?? event['employeeNumber'];
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      color: rejectedAfterOpen ? Colors.red.withValues(alpha: .06) : null,
+      child: Padding(
+        padding: const EdgeInsets.all(15),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                CircleAvatar(
+                  backgroundColor: color.withValues(alpha: .12),
+                  child: Icon(_gateEventIcon(event), color: color),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '$subject',
+                        style: const TextStyle(fontWeight: FontWeight.w900),
+                      ),
+                      if (number != null)
+                        Text('$number', style: const TextStyle(fontSize: 10)),
+                      const SizedBox(height: 3),
+                      Text(
+                        _displayValue(
+                          'deviceOccurredAt',
+                          event['deviceOccurredAt'] ?? event['occurredAt'],
+                        ),
+                        style: const TextStyle(fontSize: 10),
+                      ),
+                    ],
+                  ),
+                ),
+                _GatePill(text: _gateSystemReason(event), color: color),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _GatePill(text: _gateReader(event), color: Colors.blueGrey),
+                _GatePill(
+                  text: event['deviceDecision']?.toString() == 'ALLOWED'
+                      ? 'فتحت اللوحة'
+                      : event['deviceDecision']?.toString() == 'DENIED'
+                      ? 'رفضت اللوحة'
+                      : 'قرار غير معروف',
+                  color: event['deviceDecision']?.toString() == 'DENIED'
+                      ? Colors.red
+                      : Colors.blueGrey,
+                ),
+              ],
+            ),
+            if (rejectedAfterOpen) ...[
+              const SizedBox(height: 10),
+              const Text(
+                'تنبيه: فتحت اللوحة، لكن GO رفض تسجيل الدخول. راجع الاشتراك أو حالة العضو.',
+                style: TextStyle(
+                  color: Colors.red,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                  height: 1.5,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GatePill extends StatelessWidget {
+  const _GatePill({required this.text, required this.color});
+  final String text;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+    decoration: BoxDecoration(
+      color: color.withValues(alpha: .1),
+      borderRadius: BorderRadius.circular(99),
+      border: Border.all(color: color.withValues(alpha: .25)),
+    ),
+    child: Text(
+      text,
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(color: color, fontSize: 9, fontWeight: FontWeight.w800),
+    ),
+  );
+}
+
+bool _gateIsOnline(Map<String, dynamic> device) {
+  final seen = DateTime.tryParse(device['lastSeenAt']?.toString() ?? '');
+  return seen != null && DateTime.now().difference(seen).inSeconds < 120;
+}
+
+bool _gateAccepted(Map<String, dynamic> event) {
+  final code = event['processingCode']?.toString() ?? '';
+  return code == 'SYSTEM_ACCEPTED' || code.startsWith('EMPLOYEE_CLOCK_');
+}
+
+bool _gateNeedsReview(Map<String, dynamic> event) {
+  final status = event['processingStatus']?.toString();
+  final code = event['processingCode']?.toString() ?? '';
+  return status == 'UNMAPPED_CREDENTIAL' ||
+      status == 'FAILED' ||
+      code.startsWith('SYSTEM_REJECTED_');
+}
+
+Color _gateEventColor(Map<String, dynamic> event) {
+  if (event['deviceDecision']?.toString() == 'DENIED' ||
+      _gateNeedsReview(event)) {
+    return Colors.red;
+  }
+  return _gateAccepted(event) ? Colors.green : Colors.blueGrey;
+}
+
+IconData _gateEventIcon(Map<String, dynamic> event) {
+  if (_gateNeedsReview(event)) return Icons.warning_amber_rounded;
+  return event['direction']?.toString() == 'OUT'
+      ? Icons.logout_rounded
+      : Icons.login_rounded;
+}
+
+String _gateReader(Map<String, dynamic> event) {
+  final direction = event['direction']?.toString();
+  if (direction == 'IN') return 'قارئ الدخول';
+  if (direction == 'OUT') return 'قارئ الخروج';
+  return 'قارئ غير محدد';
+}
+
+String _gateSystemReason(Map<String, dynamic> event) {
+  const reasons = <String, String>{
+    'MEMBER_BLOCKED': 'العضو محظور',
+    'MEMBER_INACTIVE': 'العضو غير نشط',
+    'NOT_ACTIVE': 'لا يوجد اشتراك نشط',
+    'SUBSCRIPTION_FROZEN': 'الاشتراك مجمّد',
+    'OUTSIDE_ACCESS_PERIOD': 'خارج فترة الاشتراك',
+    'BRANCH_NOT_ALLOWED': 'الفرع غير مسموح',
+    'VISITS_EXHAUSTED': 'تم استنفاد الزيارات',
+    'EMPLOYEE_INACTIVE': 'الموظف غير نشط',
+    'EMPLOYEE_BRANCH_NOT_ALLOWED': 'الموظف غير معيّن هنا',
+  };
+  final code = event['processingCode']?.toString() ?? '';
+  if (code == 'SYSTEM_ACCEPTED') return 'دخول مسجل';
+  if (code == 'EMPLOYEE_CLOCK_IN_RECORDED') return 'حضور موظف';
+  if (code == 'EMPLOYEE_CLOCK_OUT_RECORDED') return 'انصراف موظف';
+  if (code.startsWith('SYSTEM_REJECTED_')) {
+    return reasons[code.substring(16)] ?? 'رفضه GO';
+  }
+  final status = event['processingStatus']?.toString();
+  if (status == 'UNMAPPED_CREDENTIAL') return 'PIN غير مربوط';
+  if (status == 'DEVICE_DENIED') return 'رفضته اللوحة';
+  if (status == 'FAILED') return 'فشل المعالجة';
+  return event['direction']?.toString() == 'OUT' ? 'حدث خروج' : 'تم تجاهله';
 }
 
 class WorkflowHubPage extends StatelessWidget {
@@ -9724,6 +10934,7 @@ bool _canRunWorkflow(GoController controller, MobileWorkflow workflow) {
 
 String? _featurePermission(String path) {
   if (path.startsWith('/self/')) return null;
+  if (path == '/organizations/{organizationId}') return 'organization.read';
   if (path.contains('/members')) return 'members.read';
   if (path.contains('/subscriptions')) return 'subscriptions.read';
   if (path.contains('/attendance-attempts')) return 'attendance.read';
@@ -9781,11 +10992,11 @@ String? _featurePermission(String path) {
   if (path.contains('/branches')) return 'branch.read';
   if (path.contains('/activities') ||
       path.contains('/service-categories') ||
-      path.contains('/services') ||
-      path.contains('/packages')) {
+      path.contains('/services')) {
     return 'catalog.read';
   }
   if (path.contains('/prices') ||
+      path.contains('/packages') ||
       path.contains('/promotions') ||
       path.contains('/commercial-policies')) {
     return 'commercial.read';
