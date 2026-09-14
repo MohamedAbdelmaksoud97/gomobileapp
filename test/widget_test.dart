@@ -1,30 +1,41 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-
 import 'package:gomobileapp/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  test('production API is the default runtime target', () {
+    expect(ApiClient().baseUrl, productionApiBaseUrl);
+  });
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+  testWidgets('GO login experience renders', (tester) async {
+    await tester.pumpWidget(GoMobileApp(apiClient: ApiClient(baseUrl: '')));
+    final app = tester.widget<MaterialApp>(find.byType(MaterialApp));
+    expect(app.theme?.colorScheme.primary, goYellow);
+    expect(app.theme?.colorScheme.onPrimary, goInk);
+    expect(find.text('تسجيل الدخول'), findsNWidgets(2));
+    expect(find.text('موظف'), findsOneWidget);
+    expect(find.text('عضو / ولي أمر'), findsOneWidget);
+    expect(find.text('تفعيل حساب عضو لأول مرة'), findsOneWidget);
+  });
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+  testWidgets('member self-service shell renders', (tester) async {
+    final controller = GoController(ApiClient(baseUrl: ''))
+      ..bootstrapping = false
+      ..authenticated = true
+      ..staffMode = false;
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Directionality(
+          textDirection: TextDirection.rtl,
+          child: MemberShell(controller: controller),
+        ),
+      ),
+    );
+
+    expect(find.text('خدماتك'), findsOneWidget);
+    expect(find.text('اشتراكاتي'), findsOneWidget);
+    expect(find.text('طلباتي'), findsWidgets);
+    controller.dispose();
   });
 }

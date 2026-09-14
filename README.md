@@ -1,17 +1,70 @@
-# gomobileapp
+# GO Fitness Mobile
 
-A new Flutter project.
+تطبيق Flutter مخصص لنظام GO Fitness، بواجهة RTL عربية وهوية بصرية مطابقة لتطبيق الويب (أسود `#151515` وأصفر أساسي `#FFCC00`). يستخدم شعار GO الأصلي من `assets/go-fitness-logo.png` في شاشة الدخول والشريط العلوي والواجهات الأساسية، ويعتمد على Material 3 مع `flex_color_scheme`.
 
-## Getting Started
+## التشغيل
 
-This project is a starting point for a Flutter application.
+```bash
+flutter pub get
+flutter run
+```
 
-A few resources to get you started if this is your first Flutter project:
+رابط الإنتاج الافتراضي مضمّن بأمان (لا يحتوي أسرارًا):
+`https://gosystem.onrender.com/api/v1`. يمكن استبداله لبيئة اختبار عبر
+`--dart-define=API_BASE_URL=https://your-api-host/api/v1`، أو تمرير قيمة فارغة
+لتشغيل وضع العرض التجريبي.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+للتشغيل على Android Emulator مع backend يعمل على نفس جهاز التطوير:
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+```bash
+flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8080/api/v1
+```
+
+يستخدم التطبيق عقد الإنتاج الحقيقي، ومن أهم المسارات:
+
+- `POST /auth/staff/password/sign-ins` أو `POST /auth/member/password/sign-ins`
+- `GET /organizations/{organizationId}/dashboard/summary?branchId=...`
+- `GET /me/account-notifications?limit=30`
+- `GET /self` ومسارات `/self/organizations/...` لبوابة العضو وولي الأمر
+- `GET /openapi.json` لبناء مركز موحد لكل عمليات النظام الموثقة
+- `GET/PATCH /self/account` و`POST /self/account/password-changes`
+- مسارات الطلبات والمدفوعات والحجوزات والاشتراكات وCRM والمالية والتقارير والتشغيل
+
+يتم حفظ access/refresh tokens ونوع الجلسة في `flutter_secure_storage` مع تجديد تلقائي للجلسة. تعرض إشعارات صندوق الحساب داخل التطبيق وتصدر تنبيهًا نظاميًا عند وصول رسالة جديدة أثناء عمل التطبيق. الإشعار الخارجي الحقيقي في الخلفية يتطلب إعداد مشروع FCM/APNs وبيانات اعتماده وإضافة device-token endpoint إلى الـbackend؛ هذه المدخلات غير موجودة حاليًا في المستودعين ولذلك لم تُضمّن مفاتيح وهمية أو غير آمنة.
+
+## ما تم بناؤه
+
+- تسجيل دخول الموظف أو العضو بتصميم متجاوب.
+- لوحة مؤشرات: الأعضاء، الاشتراكات، الدخول، الإيرادات، مخطط أسبوعي، إجراءات سريعة وتنبيهات تشغيلية.
+- دليل أعضاء مع بحث وحالات العضوية ونموذج تسجيل عضو فعلي مطابق لعقد الـAPI.
+- مركز تشغيل للحضور والحجوزات ونقطة البيع والمطعم وجدول اليوم، مع تسجيل دخول عضو فعلي.
+- صندوق رسائل وإشعارات مع عداد غير المقروء وتحديد الكل كمقروء.
+- مساحة «المزيد» للمالية والتقارير والمطعم والتدريب وCRM والتواصل والموظفين وإعدادات النظام، مصفاة حسب صلاحيات الحساب والفرع.
+- أكثر من 50 وحدة قراءة أصلية، تشمل الطلبات والمدفوعات والاستردادات والصندوق والكتالوج والباقات والأسعار والعروض والمرافق والمطعم والمتجر والمخزون والقياسات والدوام والبوابات والخزائن والملفات والحملات والمستخدمين والأدوار.
+- نماذج موبايل فعلية للاشتراك والدفع والحجز وCRM والمصروف والإيراد والمناوبة والمطعم والموظف والقياسات وتحديث التقارير.
+- إجراءات على السجلات للتجميد والاستئناف والإلغاء، إكمال الحجوزات، تجهيز وتسليم طلبات المطعم، مراحل CRM، اعتماد المصروفات، وطلبات الانضمام.
+- تفاصيل عضو مترابطة مع ملفه المالي والتشغيلي، وإصدار رمز التفعيل وإعادة تعيين كلمة المرور والحظر.
+- بوابة مستقلة للعضو/ولي الأمر تعرض الاشتراكات والحضور والحجوزات والخطط والقياسات والطلبات والفواتير والملفات والتواصل، مع شراء الباقات وطلب وجبات قائمة اليوم وتفعيل الحساب لأول مرة.
+- مساحة ملفات أصلية للموبايل: اختيار JPG/PNG/PDF، حساب SHA-256 محليًا، signed upload إلى التخزين الخاص، إكمال الفحص الأمني، وتنزيل الرابط الموقّع فقط للملفات النظيفة.
+- بحث شامل سريع للموظفين عن الأعضاء والموظفين والاشتراكات والفواتير، مع فتح السجل المقصود من النتيجة.
+- مسح باركود العضوية بالكاميرا لتسجيل الحضور؛ تتم مطابقة الرمز محليًا بقائمة أعضاء الفرع ثم تُرسل محاولة الدخول إلى `/attendance-attempts`.
+- تبديل المؤسسة والفرع مع حفظ السياق، وإعدادات الحساب واللغة والتوقيت والتنبيهات وكلمة المرور.
+- مركز عمليات يقرأ OpenAPI الحي ويتيح كل endpoint موثق، مع تعبئة السياق وتأكيد صريح قبل أي عملية كتابية.
+- الوضع الداكن، RTL، touch targets مناسبة، pull-to-refresh، وحالات العرض التجريبي/الاتصال الحقيقي.
+
+## التحقق والبناء
+
+تم التحقق محليًا عبر:
+
+```bash
+flutter analyze
+flutter test
+flutter build web --no-wasm-dry-run
+flutter build apk --debug
+```
+
+ملفات Android الناتجة موجودة في `build/app/outputs/flutter-apk/`. نسخة
+`go-fitness-production-debug.apk` تتصل افتراضيًا بخادم Render. هوية الحزمة هي
+`com.gofitness.app` ويدعم Android API 24 فما فوق، مع `targetSdkVersion 36`.
+
+تحتاج ميزة الملفات إلى صلاحية اختيار الملفات، وتحتاج ميزة مسح الباركود إلى صلاحية الكاميرا (تمت إضافة الوصف العربي في Android وiOS). الحزم الأصلية المستخدمة هي `file_picker` و`mobile_scanner` و`url_launcher` و`crypto`.
