@@ -1,6 +1,6 @@
 # GO Fitness Mobile
 
-تطبيق Flutter مخصص لنظام GO Fitness، بواجهة RTL عربية وهوية بصرية مطابقة لتطبيق الويب (أسود `#151515` وأصفر أساسي `#FFCC00`). يستخدم شعار GO الأصلي من `assets/go-fitness-logo.png` في شاشة الدخول والشريط العلوي والواجهات الأساسية، ويعتمد على Material 3 مع `flex_color_scheme`.
+تطبيق Flutter مخصص لنظام GO Fitness، بواجهة RTL عربية وهوية بصرية مطابقة لتطبيق الويب (أسود `#151515` وأصفر أساسي `#FFCC00`). يستخدم شعار GO الأصلي من `assets/go-fitness-emblem.png` داخل التطبيق وفي أيقونات Android وiOS والويب، ويعتمد على Material 3 مع `flex_color_scheme`.
 
 ## التشغيل
 
@@ -23,7 +23,7 @@ flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8080/api/v1
 يستخدم التطبيق عقد الإنتاج الحقيقي، ومن أهم المسارات:
 
 - `POST /auth/staff/password/sign-ins` أو `POST /auth/member/password/sign-ins`
-- `GET /organizations/{organizationId}/dashboard/summary?branchId=...`
+- `GET /organizations/{organizationId}/dashboard/summary?branchId=...&from=...&to=...`
 - `GET /me/account-notifications?limit=30`
 - `GET /self` ومسارات `/self/organizations/...` لبوابة العضو وولي الأمر
 - `GET /openapi.json` لبناء مركز موحد لكل عمليات النظام الموثقة
@@ -35,12 +35,12 @@ flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8080/api/v1
 ## ما تم بناؤه
 
 - تسجيل دخول الموظف أو العضو بتصميم متجاوب.
-- لوحة مؤشرات: الأعضاء، الاشتراكات، الدخول، الإيرادات، مخطط أسبوعي، إجراءات سريعة وتنبيهات تشغيلية.
+- لوحة مؤشرات: الأعضاء، الاشتراكات، الدخول، الإيرادات، مخطط 30 يومًا من بيانات التقرير الحقيقية، إجراءات سريعة وتنبيهات تشغيلية.
 - دليل أعضاء مع بحث وحالات العضوية ونموذج تسجيل عضو فعلي مطابق لعقد الـAPI.
 - مركز تشغيل للحضور والحجوزات ونقطة البيع والمطعم وجدول اليوم، مع تسجيل دخول عضو فعلي.
 - صندوق رسائل وإشعارات مع عداد غير المقروء وتحديد الكل كمقروء.
 - مساحة «المزيد» للمالية والتقارير والمطعم والتدريب وCRM والتواصل والموظفين وإعدادات النظام، مصفاة حسب صلاحيات الحساب والفرع.
-- أكثر من 50 وحدة قراءة أصلية، تشمل الطلبات والمدفوعات والاستردادات والصندوق والكتالوج والباقات والأسعار والعروض والمرافق والمطعم والمتجر والمخزون والقياسات والدوام والبوابات والخزائن والملفات والحملات والمستخدمين والأدوار.
+- 64 وحدة قراءة للموظفين و16 وحدة خدمة ذاتية للعضو، تشمل الطلبات والمدفوعات والاستردادات والصندوق والكتالوج والباقات والأسعار والعروض والمرافق والمطعم والمتجر والمخزون والقياسات والدوام والبوابات والخزائن والملفات والحملات والمستخدمين والأدوار.
 - نماذج موبايل فعلية للاشتراك والدفع والحجز وCRM والمصروف والإيراد والمناوبة والمطعم والموظف والقياسات وتحديث التقارير.
 - إجراءات على السجلات للتجميد والاستئناف والإلغاء، إكمال الحجوزات، تجهيز وتسليم طلبات المطعم، مراحل CRM، اعتماد المصروفات، وطلبات الانضمام.
 - تفاصيل عضو مترابطة مع ملفه المالي والتشغيلي، وإصدار رمز التفعيل وإعادة تعيين كلمة المرور والحظر.
@@ -59,12 +59,51 @@ flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8080/api/v1
 ```bash
 flutter analyze
 flutter test
-flutter build web --no-wasm-dry-run
-flutter build apk --debug
+flutter build web --release
+flutter build apk --release
 ```
 
-ملفات Android الناتجة موجودة في `build/app/outputs/flutter-apk/`. نسخة
-`go-fitness-production-debug.apk` تتصل افتراضيًا بخادم Render. هوية الحزمة هي
+ملفات Android الناتجة موجودة في `build/app/outputs/flutter-apk/`، ونسخة
+`app-release.apk` تتصل افتراضيًا بخادم Render. هوية الحزمة هي
 `com.gofitness.app` ويدعم Android API 24 فما فوق، مع `targetSdkVersion 36`.
 
 تحتاج ميزة الملفات إلى صلاحية اختيار الملفات، وتحتاج ميزة مسح الباركود إلى صلاحية الكاميرا (تمت إضافة الوصف العربي في Android وiOS). الحزم الأصلية المستخدمة هي `file_picker` و`mobile_scanner` و`url_launcher` و`crypto`.
+
+## المعاينة على الأجهزة
+
+للمعاينة السريعة في Chrome بمقاس هاتف:
+
+```bash
+flutter run -d chrome --web-port 50550
+```
+
+للمعاينة على Android، شغّل Emulator من Android Studio أو صِل هاتفًا مع USB debugging، ثم:
+
+```bash
+flutter devices
+flutter run -d <android-device-id>
+```
+
+وللتثبيت المباشر بعد بناء Release:
+
+```bash
+adb install -r build/app/outputs/flutter-apk/app-release.apk
+```
+
+يلزم macOS لبناء iOS. بعد تثبيت Xcode وCocoaPods وفتح المشروع على Mac:
+
+```bash
+flutter pub get
+cd ios
+pod install
+cd ..
+open ios/Runner.xcworkspace
+flutter devices
+flutter run -d <ios-device-id>
+```
+
+اختر Apple Team وBundle Identifier من Signing & Capabilities داخل Xcode. ولإنشاء ملف توزيع بعد إعداد الشهادات:
+
+```bash
+flutter build ipa --release
+```

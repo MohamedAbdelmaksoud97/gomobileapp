@@ -1,11 +1,11 @@
 {
-    "name": "gomobileapp",
-    "short_name": "gomobileapp",
+    "name": "GO Fitness",
+    "short_name": "GO Fitness",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#151515",
+    "theme_color": "#FFCC00",
+    "description": "تطبيق GO Fitness لإدارة النادي وخدمة الأعضاء.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

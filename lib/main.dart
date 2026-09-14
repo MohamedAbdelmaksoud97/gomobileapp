@@ -6,6 +6,7 @@ import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flex_color_scheme/flex_color_scheme.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -18,6 +19,66 @@ const goYellow = Color(0xFFFFCC00);
 const goInk = Color(0xFF151515);
 const goCanvas = Color(0xFFF7F7F5);
 const productionApiBaseUrl = 'https://gosystem.onrender.com/api/v1';
+
+typedef ApiDateRange = ({String from, String to});
+
+/// Saudi Arabia has a fixed UTC+3 offset and no daylight-saving time. Building
+/// the boundary in UTC keeps the API range identical on Android, iOS and web,
+/// regardless of the device time zone.
+ApiDateRange riyadhDateRange({int days = 1}) {
+  final riyadhNow = DateTime.now().toUtc().add(const Duration(hours: 3));
+  final localMidnightUtc = DateTime.utc(
+    riyadhNow.year,
+    riyadhNow.month,
+    riyadhNow.day,
+  ).subtract(const Duration(hours: 3));
+  final from = localMidnightUtc.subtract(Duration(days: days - 1));
+  final to = localMidnightUtc.add(const Duration(days: 1));
+  return (from: from.toIso8601String(), to: to.toIso8601String());
+}
+
+String riyadhBusinessDate() {
+  final value = DateTime.now().toUtc().add(const Duration(hours: 3));
+  String two(int part) => part.toString().padLeft(2, '0');
+  return '${value.year}-${two(value.month)}-${two(value.day)}';
+}
+
+Map<String, String> resourceQueryFor(String path, String branchId) {
+  if (path.endsWith('/crm/lead-sources')) return const {};
+  if (path.endsWith('/daily-menu')) {
+    return {'branchId': branchId, 'businessDate': riyadhBusinessDate()};
+  }
+  if (path.endsWith('/employee-shifts') ||
+      path.endsWith('/employee-attendance') ||
+      path.endsWith('/other-income')) {
+    final range = riyadhDateRange(days: 30);
+    return {'branchId': branchId, 'from': range.from, 'to': range.to};
+  }
+  if (path.startsWith('/self/') &&
+      (path.endsWith('/services') ||
+          path.endsWith('/packages') ||
+          path.endsWith('/bookable-resources'))) {
+    return {'branchId': branchId};
+  }
+  return {'branchId': branchId, 'limit': '100'};
+}
+
+class ApiFailure implements Exception {
+  const ApiFailure(this.message, {this.statusCode, this.code});
+
+  final String message;
+  final int? statusCode;
+  final String? code;
+
+  bool get isNotFound => statusCode == 404;
+
+  @override
+  String toString() => message;
+}
+
+String _errorMessage(Object exception) => exception is ApiFailure
+    ? exception.message
+    : exception.toString().replaceFirst('Exception: ', '');
 
 void main() => runApp(const GoMobileApp());
 
@@ -147,11 +208,13 @@ class ApiClient {
       );
       response = await http.Response.fromStream(streamed);
     } on TimeoutException {
-      throw Exception(
+      throw const ApiFailure(
         'استغرق الخادم وقتًا طويلًا. تحقق من الشبكة وحاول مجددًا.',
       );
     } on http.ClientException {
-      throw Exception('تعذر الوصول إلى الخادم. تحقق من اتصال الإنترنت.');
+      throw const ApiFailure(
+        'تعذر الوصول إلى الخادم. تحقق من اتصال الإنترنت وحاول مجددًا.',
+      );
     }
     if (response.statusCode == 401 &&
         retryAuthentication &&
@@ -168,7 +231,8 @@ class ApiClient {
       }
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      String message = 'تعذر الاتصال بالخادم (${response.statusCode})';
+      String message = 'تعذر إتمام الطلب (${response.statusCode})';
+      String? code;
       try {
         final problem = jsonDecode(response.body);
         if (problem is Map) {
@@ -176,9 +240,10 @@ class ApiClient {
               problem['detail']?.toString() ??
               problem['title']?.toString() ??
               message;
+          code = problem['code']?.toString();
         }
       } catch (_) {}
-      throw Exception(message);
+      throw ApiFailure(message, statusCode: response.statusCode, code: code);
     }
     if (response.statusCode == 204 || response.body.isEmpty) return null;
     final decoded = jsonDecode(response.body);
@@ -248,13 +313,18 @@ class ApiClient {
     required String password,
   }) async {
     if (!configured) return;
+    final memberUsesTestEmail = !staff && identifier.contains('@');
     final data = await request(
       staff
           ? '/auth/staff/password/sign-ins'
+          : memberUsesTestEmail
+          ? '/auth/member/test-email/password/sign-ins'
           : '/auth/member/password/sign-ins',
       method: 'POST',
       body: staff
           ? {'identifier': identifier, 'password': password}
+          : memberUsesTestEmail
+          ? {'email': identifier, 'password': password}
           : {'phone': identifier, 'password': password},
     );
     if (data is Map<String, dynamic>) {
@@ -387,11 +457,28 @@ class ApiClient {
     String organizationId,
     String branchId,
   ) async {
+    final range = riyadhDateRange();
     final data = await request(
       '/organizations/$organizationId/dashboard/summary',
-      query: {'branchId': branchId},
+      query: {'branchId': branchId, 'from': range.from, 'to': range.to},
     );
     return data is Map ? Map<String, dynamic>.from(data) : null;
+  }
+
+  Future<List<Map<String, dynamic>>> revenueTrend(
+    String organizationId,
+    String branchId,
+  ) async {
+    final range = riyadhDateRange(days: 30);
+    final data = await request(
+      '/organizations/$organizationId/reports/revenue-trend',
+      query: {'branchId': branchId, 'from': range.from, 'to': range.to},
+    );
+    if (data is! List) return [];
+    return data
+        .whereType<Map>()
+        .map((row) => Map<String, dynamic>.from(row))
+        .toList();
   }
 
   Future<List<Map<String, dynamic>>> notifications() async {
@@ -421,12 +508,7 @@ class ApiClient {
     String path, {
     String? memberId,
   }) async {
-    final query = <String, String>{'branchId': branchId, 'limit': '100'};
-    if (path.endsWith('/daily-menu')) {
-      query
-        ..remove('limit')
-        ..['businessDate'] = DateTime.now().toIso8601String().substring(0, 10);
-    }
+    final query = resourceQueryFor(path, branchId);
     final data = await request(
       path
           .replaceAll('{organizationId}', organizationId)
@@ -578,6 +660,24 @@ const apiModuleLabels = <String, String>{
 const _permissionImplications = <String, List<String>>{
   'members.manage': ['members.read'],
   'members.block': ['members.read', 'subscriptions.read'],
+  'members.sensitive.read': ['members.contacts.read'],
+  'members.sensitive.manage': ['members.sensitive.read'],
+  'members.accounts.manage': ['members.read'],
+  'workforce.manage': ['workforce.read'],
+  'workforce.assignments.manage': ['workforce.read'],
+  'workforce.accounts.manage': ['workforce.read'],
+  'files.manage': ['files.read'],
+  'attendance.devices.manage': ['attendance.devices.read'],
+  'catalog.manage': ['catalog.read'],
+  'catalog.availability.manage': ['catalog.read'],
+  'commercial.manage': ['commercial.read'],
+  'pricing.manage': ['commercial.read'],
+  'promotions.manage': ['commercial.read'],
+  'policies.manage': ['commercial.read'],
+  'subscriptions.freeze': ['subscriptions.read'],
+  'subscriptions.cancel': ['subscriptions.read'],
+  'subscriptions.renew': ['subscriptions.read'],
+  'subscriptions.adjustments.manage': ['subscriptions.read'],
   'sales.checkout': [
     'sales.read',
     'members.read',
@@ -588,6 +688,8 @@ const _permissionImplications = <String, List<String>>{
     'retail.inventory.read',
   ],
   'finance.payments.record': ['finance.payments.read', 'finance.invoices.read'],
+  'finance.refunds.issue': ['finance.payments.read'],
+  'finance.refunds.approve': ['finance.payments.read'],
   'finance.expenses.manage': ['finance.expenses.read'],
   'finance.expenses.approve': ['finance.expenses.read'],
   'finance.expenses.pay': ['finance.expenses.read'],
@@ -598,8 +700,8 @@ const _permissionImplications = <String, List<String>>{
   ],
   'bookings.create': ['bookings.read', 'members.read', 'catalog.read'],
   'bookings.manage': ['bookings.read', 'members.read', 'catalog.read'],
-  'workforce.manage': ['workforce.read'],
   'workforce.shifts.manage': ['workforce.shifts.read', 'workforce.read'],
+  'workforce.attendance.record': ['workforce.shifts.read', 'workforce.read'],
   'crm.leads.manage': ['crm.leads.read'],
   'restaurant.orders.prepare': ['restaurant.orders.read'],
   'restaurant.orders.manage': ['restaurant.orders.read'],
@@ -609,21 +711,12 @@ const _permissionImplications = <String, List<String>>{
   'finance.other-income.manage': ['finance.other-income.read'],
   'iam.roles.manage': ['iam.roles.read'],
   'iam.assignments.manage': ['iam.roles.read', 'iam.accounts.read'],
-  'catalog.manage': ['catalog.read'],
-  'commercial.manage': ['commercial.read'],
-  'pricing.manage': ['commercial.read'],
-  'promotions.manage': ['commercial.read'],
-  'policies.manage': ['commercial.read'],
   'measurements.manage': ['measurements.read', 'members.read'],
   'measurement-types.manage': ['measurements.read'],
   'access-credentials.manage': ['access-credentials.read', 'members.read'],
   'online-requests.manage': ['online-requests.read'],
   'lockers.manage': ['lockers.read', 'members.read'],
   'branch.manage': ['branch.read', 'organization.read'],
-  'workforce.assignments.manage': ['workforce.read'],
-  'workforce.accounts.manage': ['workforce.read'],
-  'files.manage': ['files.read'],
-  'attendance.devices.manage': ['attendance.devices.read'],
   'bookings.facilities.manage': ['bookings.read', 'coaching.read'],
   'finance.cash-points.manage': ['finance.cash-points.read'],
   'finance.cash-shifts.manage': ['finance.cash-points.read'],
@@ -639,6 +732,7 @@ const _permissionImplications = <String, List<String>>{
   'coaching.manage': ['coaching.read', 'workforce.read'],
   'coaching.assignments.manage': ['coaching.read', 'members.read'],
   'coaching.schedule.manage': ['coaching.read'],
+  'reporting.rebuild': ['reporting.read'],
   'notifications.whatsapp.manage': ['notifications.whatsapp.read'],
   'coaching.commissions.manage': [
     'coaching.commissions.read',
@@ -2537,11 +2631,17 @@ class GoController extends ChangeNotifier {
   bool authenticated = false;
   bool bootstrapping = true;
   bool loading = false;
+  bool refreshing = false;
   bool darkMode = false;
   bool staffMode = true;
   int tab = 0;
   String? error;
+  String? dashboardError;
+  String? analyticsError;
+  String? membersError;
+  String? notificationsError;
   Map<String, dynamic> summary = {};
+  List<Map<String, dynamic>> revenue = [];
   List<Map<String, dynamic>> notices = [];
   List<Map<String, dynamic>> members = [];
   List<Map<String, dynamic>> selfMembers = [];
@@ -2782,13 +2882,46 @@ class GoController extends ChangeNotifier {
         .map((n) => n['id']?.toString() ?? n['title']?.toString())
         .toSet();
     if (api.configured) {
-      try {
-        notices = await api.notifications();
-        if (staffMode) {
-          summary = await api.dashboard(organizationId, branchId) ?? {};
-          members = await api.members(organizationId, branchId);
-        }
-      } catch (_) {}
+      refreshing = true;
+      notifyListeners();
+      await Future.wait<void>([
+        () async {
+          try {
+            notices = await api.notifications();
+            notificationsError = null;
+          } catch (exception) {
+            notificationsError = _errorMessage(exception);
+          }
+        }(),
+        if (staffMode && can('reporting.read'))
+          () async {
+            try {
+              summary = await api.dashboard(organizationId, branchId) ?? {};
+              dashboardError = null;
+            } catch (exception) {
+              dashboardError = _errorMessage(exception);
+            }
+          }(),
+        if (staffMode && can('reporting.read'))
+          () async {
+            try {
+              revenue = await api.revenueTrend(organizationId, branchId);
+              analyticsError = null;
+            } catch (exception) {
+              analyticsError = _errorMessage(exception);
+            }
+          }(),
+        if (staffMode && can('members.read'))
+          () async {
+            try {
+              members = await api.members(organizationId, branchId);
+              membersError = null;
+            } catch (exception) {
+              membersError = _errorMessage(exception);
+            }
+          }(),
+      ]);
+      refreshing = false;
     }
     if (!api.configured && summary.isEmpty) {
       summary = {
@@ -2849,12 +2982,19 @@ class GoController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void markAllRead() {
+  Future<void> markAllRead() async {
     for (final notice in notices) {
       notice['unread'] = false;
     }
     notifyListeners();
-    if (api.configured) unawaited(api.markAllNotificationsRead());
+    if (!api.configured) return;
+    try {
+      await api.markAllNotificationsRead();
+      notificationsError = null;
+    } catch (exception) {
+      notificationsError = _errorMessage(exception);
+    }
+    notifyListeners();
   }
 
   Future<void> openNotification(Map<String, dynamic> notice) async {
@@ -2862,7 +3002,15 @@ class GoController extends ChangeNotifier {
     notice['unread'] = false;
     notifyListeners();
     final id = notice['id']?.toString();
-    if (api.configured && id != null) await api.markNotificationRead(id);
+    if (api.configured && id != null) {
+      try {
+        await api.markNotificationRead(id);
+        notificationsError = null;
+      } catch (exception) {
+        notificationsError = _errorMessage(exception);
+        notifyListeners();
+      }
+    }
   }
 
   void setTab(int value) {
@@ -2887,6 +3035,110 @@ class GoMobileApp extends StatefulWidget {
   final ApiClient? apiClient;
   @override
   State<GoMobileApp> createState() => _GoMobileAppState();
+}
+
+ThemeData _goTheme(Brightness brightness) {
+  final dark = brightness == Brightness.dark;
+  final base = dark
+      ? FlexThemeData.dark(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: goYellow,
+            brightness: Brightness.dark,
+            primary: goYellow,
+            onPrimary: goInk,
+            surface: goInk,
+          ),
+          surfaceMode: FlexSurfaceMode.level,
+          blendLevel: 8,
+          fontFamily: GoogleFonts.cairo().fontFamily,
+          useMaterial3: true,
+        )
+      : FlexThemeData.light(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: goYellow,
+            primary: goYellow,
+            onPrimary: goInk,
+            surface: goCanvas,
+          ),
+          surfaceMode: FlexSurfaceMode.level,
+          blendLevel: 4,
+          fontFamily: GoogleFonts.cairo().fontFamily,
+          scaffoldBackground: goCanvas,
+          useMaterial3: true,
+        );
+  final colors = base.colorScheme;
+  return base.copyWith(
+    visualDensity: VisualDensity.standard,
+    appBarTheme: base.appBarTheme.copyWith(
+      centerTitle: false,
+      elevation: 0,
+      scrolledUnderElevation: 1,
+      backgroundColor: dark ? goInk : goCanvas,
+      surfaceTintColor: Colors.transparent,
+    ),
+    cardTheme: CardThemeData(
+      elevation: 0,
+      margin: EdgeInsets.zero,
+      color: colors.surfaceContainerLowest,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: BorderSide(color: colors.outlineVariant.withValues(alpha: .65)),
+      ),
+    ),
+    inputDecorationTheme: InputDecorationTheme(
+      filled: true,
+      fillColor: colors.surfaceContainerLowest,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(16),
+        borderSide: BorderSide(color: colors.outlineVariant),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(16),
+        borderSide: BorderSide(color: colors.outlineVariant),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(16),
+        borderSide: const BorderSide(color: goYellow, width: 2),
+      ),
+    ),
+    filledButtonTheme: FilledButtonThemeData(
+      style: FilledButton.styleFrom(
+        minimumSize: const Size(44, 48),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+        textStyle: const TextStyle(fontWeight: FontWeight.w800),
+      ),
+    ),
+    outlinedButtonTheme: OutlinedButtonThemeData(
+      style: OutlinedButton.styleFrom(
+        minimumSize: const Size(44, 46),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+      ),
+    ),
+    navigationBarTheme: NavigationBarThemeData(
+      height: 72,
+      elevation: 3,
+      backgroundColor: colors.surfaceContainerLowest,
+      indicatorColor: goYellow.withValues(alpha: .22),
+      labelTextStyle: WidgetStateProperty.resolveWith(
+        (states) => TextStyle(
+          fontSize: 11,
+          fontWeight: states.contains(WidgetState.selected)
+              ? FontWeight.w800
+              : FontWeight.w600,
+        ),
+      ),
+    ),
+    snackBarTheme: SnackBarThemeData(
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    ),
+    dividerTheme: DividerThemeData(
+      color: colors.outlineVariant.withValues(alpha: .7),
+      thickness: 1,
+    ),
+  );
 }
 
 class _GoMobileAppState extends State<GoMobileApp> with WidgetsBindingObserver {
@@ -2921,43 +3173,22 @@ class _GoMobileAppState extends State<GoMobileApp> with WidgetsBindingObserver {
       debugShowCheckedModeBanner: false,
       title: 'GO Fitness',
       locale: const Locale('ar'),
-      themeMode: controller.darkMode ? ThemeMode.dark : ThemeMode.light,
-      theme: FlexThemeData.light(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: goYellow,
-          primary: goYellow,
-          onPrimary: goInk,
-          surface: goCanvas,
-        ),
-        surfaceMode: FlexSurfaceMode.level,
-        blendLevel: 4,
-        fontFamily: GoogleFonts.cairo().fontFamily,
-        scaffoldBackground: goCanvas,
-        useMaterial3: true,
-      ),
-      darkTheme: FlexThemeData.dark(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: goYellow,
-          brightness: Brightness.dark,
-          primary: goYellow,
-          onPrimary: goInk,
-          surface: goInk,
-        ),
-        surfaceMode: FlexSurfaceMode.level,
-        blendLevel: 8,
-        fontFamily: GoogleFonts.cairo().fontFamily,
-        useMaterial3: true,
-      ),
-      home: Directionality(
+      supportedLocales: const [Locale('ar')],
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
+      builder: (context, child) => Directionality(
         textDirection: TextDirection.rtl,
-        child: controller.bootstrapping
-            ? const _BootstrapScreen()
-            : controller.authenticated
-            ? controller.staffMode
-                  ? GoShell(controller: controller)
-                  : MemberShell(controller: controller)
-            : LoginScreen(controller: controller),
+        child: child ?? const SizedBox.shrink(),
       ),
+      themeMode: controller.darkMode ? ThemeMode.dark : ThemeMode.light,
+      theme: _goTheme(Brightness.light),
+      darkTheme: _goTheme(Brightness.dark),
+      home: controller.bootstrapping
+          ? const _BootstrapScreen()
+          : controller.authenticated
+          ? controller.staffMode
+                ? GoShell(controller: controller)
+                : MemberShell(controller: controller)
+          : LoginScreen(controller: controller),
     ),
   );
 }
@@ -3136,17 +3367,23 @@ class _LoginScreenState extends State<LoginScreen> {
                         TextField(
                           controller: identifier,
                           textDirection: TextDirection.ltr,
-                          keyboardType: staff
-                              ? TextInputType.emailAddress
-                              : TextInputType.phone,
+                          keyboardType: TextInputType.emailAddress,
+                          textInputAction: TextInputAction.next,
+                          autofillHints: staff
+                              ? const [AutofillHints.username]
+                              : const [
+                                  AutofillHints.telephoneNumber,
+                                  AutofillHints.email,
+                                ],
                           decoration: InputDecoration(
                             labelText: staff
                                 ? 'الرقم الوظيفي أو البريد الإلكتروني'
-                                : 'رقم الجوال المسجل',
+                                : 'رقم الجوال أو البريد الإلكتروني',
+                            helperText: staff ? null : 'أدخل وسيلة الدخول المرتبطة بحساب العضو أو ولي الأمر',
                             prefixIcon: Icon(
                               staff
                                   ? Icons.badge_outlined
-                                  : Icons.phone_outlined,
+                                  : Icons.alternate_email_rounded,
                             ),
                           ),
                         ),
@@ -3155,6 +3392,7 @@ class _LoginScreenState extends State<LoginScreen> {
                           controller: password,
                           obscureText: obscure,
                           textDirection: TextDirection.ltr,
+                          autofillHints: const [AutofillHints.password],
                           onSubmitted: (_) => submit(),
                           decoration: InputDecoration(
                             labelText: 'كلمة المرور',
@@ -3461,35 +3699,71 @@ class GoShell extends StatelessWidget {
   const GoShell({super.key, required this.controller});
   final GoController controller;
   static const destinations = [
-    ('الرئيسية', Icons.space_dashboard_rounded),
-    ('الأعضاء', Icons.people_alt_outlined),
-    ('التشغيل', Icons.calendar_month_outlined),
-    ('الرسائل', Icons.forum_outlined),
-    ('المزيد', Icons.grid_view_rounded),
+    (0, 'الرئيسية', Icons.space_dashboard_rounded),
+    (1, 'الأعضاء', Icons.people_alt_outlined),
+    (2, 'التشغيل', Icons.calendar_month_outlined),
+    (3, 'التنبيهات', Icons.notifications_none_rounded),
+    (4, 'المزيد', Icons.grid_view_rounded),
   ];
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(
-      title: const GoLogo(),
-      actions: [
-        TextButton.icon(
-          onPressed: () => _openContextSheet(context, controller),
-          icon: const Icon(Icons.location_on_outlined, size: 18),
-          label: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 120),
-            child: Text(controller.branchName, overflow: TextOverflow.ellipsis),
-          ),
-        ),
-        IconButton(
-          onPressed: controller.toggleTheme,
-          icon: Icon(
-            controller.darkMode
-                ? Icons.light_mode_outlined
-                : Icons.dark_mode_outlined,
-          ),
-          tooltip: 'تغيير المظهر',
-        ),
-        if (controller.staffMode)
+  Widget build(BuildContext context) {
+    final compact = MediaQuery.sizeOf(context).width < 600;
+    final visibleDestinations = destinations.where((destination) {
+      if (destination.$1 == 1) return controller.can('members.read');
+      if (destination.$1 == 2) {
+        return controller.can('attendance.read') ||
+            controller.can('bookings.read') ||
+            controller.can('workforce.shifts.read') ||
+            controller.can('restaurant.orders.read') ||
+            controller.can('finance.invoices.read');
+      }
+      return true;
+    }).toList();
+    final selectedDestination = max(
+      0,
+      visibleDestinations.indexWhere((item) => item.$1 == controller.tab),
+    );
+    final pages = [
+      DashboardPage(controller: controller),
+      MembersPage(controller: controller),
+      OperationsPage(controller: controller),
+      MessagesPage(controller: controller),
+      MorePage(controller: controller),
+    ];
+    final content = IndexedStack(index: controller.tab, children: pages);
+    return Scaffold(
+      appBar: AppBar(
+        titleSpacing: compact ? 12 : 16,
+        title: const GoLogo(),
+        actions: [
+          if (compact)
+            IconButton(
+              onPressed: () => _openContextSheet(context, controller),
+              icon: const Icon(Icons.location_on_outlined),
+              tooltip: 'الفرع: ${controller.branchName}',
+            )
+          else
+            TextButton.icon(
+              onPressed: () => _openContextSheet(context, controller),
+              icon: const Icon(Icons.location_on_outlined, size: 18),
+              label: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 150),
+                child: Text(
+                  controller.branchName,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ),
+          if (!compact)
+            IconButton(
+              onPressed: controller.toggleTheme,
+              icon: Icon(
+                controller.darkMode
+                    ? Icons.light_mode_outlined
+                    : Icons.dark_mode_outlined,
+              ),
+              tooltip: 'تغيير المظهر',
+            ),
           IconButton(
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
@@ -3499,55 +3773,55 @@ class GoShell extends StatelessWidget {
             icon: const Icon(Icons.search_rounded),
             tooltip: 'بحث شامل',
           ),
-        NotificationButton(controller: controller),
-        const SizedBox(width: 8),
-      ],
-    ),
-    body: LayoutBuilder(
-      builder: (context, size) {
-        final page = [
-          DashboardPage(controller: controller),
-          MembersPage(controller: controller),
-          OperationsPage(controller: controller),
-          MessagesPage(controller: controller),
-          MorePage(controller: controller),
-        ][controller.tab];
-        if (size.maxWidth >= 900) {
-          return Row(
-            children: [
-              NavigationRail(
-                selectedIndex: controller.tab,
-                onDestinationSelected: controller.setTab,
-                labelType: NavigationRailLabelType.all,
-                destinations: destinations
-                    .map(
-                      (d) => NavigationRailDestination(
-                        icon: Icon(d.$2),
-                        label: Text(d.$1),
-                      ),
-                    )
-                    .toList(),
-              ),
-              const VerticalDivider(width: 1),
-              Expanded(child: page),
-            ],
-          );
-        }
-        return page;
-      },
-    ),
-    bottomNavigationBar: MediaQuery.sizeOf(context).width < 900
-        ? NavigationBar(
-            selectedIndex: controller.tab,
-            onDestinationSelected: controller.setTab,
-            destinations: destinations
-                .map(
-                  (d) => NavigationDestination(icon: Icon(d.$2), label: d.$1),
-                )
-                .toList(),
-          )
-        : null,
-  );
+          NotificationButton(controller: controller),
+          const SizedBox(width: 4),
+        ],
+      ),
+      body: LayoutBuilder(
+        builder: (context, size) {
+          if (size.maxWidth >= 900) {
+            return Row(
+              children: [
+                NavigationRail(
+                  selectedIndex: selectedDestination,
+                  onDestinationSelected: (index) =>
+                      controller.setTab(visibleDestinations[index].$1),
+                  labelType: NavigationRailLabelType.all,
+                  destinations: visibleDestinations
+                      .map(
+                        (d) => NavigationRailDestination(
+                          icon: Icon(d.$3),
+                          label: Text(d.$2),
+                        ),
+                      )
+                      .toList(),
+                ),
+                const VerticalDivider(width: 1),
+                Expanded(child: content),
+              ],
+            );
+          }
+          return content;
+        },
+      ),
+      bottomNavigationBar: MediaQuery.sizeOf(context).width < 900
+          ? NavigationBar(
+              selectedIndex: selectedDestination,
+              onDestinationSelected: (index) =>
+                  controller.setTab(visibleDestinations[index].$1),
+              destinations: visibleDestinations
+                  .map(
+                    (d) => NavigationDestination(
+                      icon: Icon(d.$3),
+                      selectedIcon: Icon(d.$3, fill: 1),
+                      label: d.$2,
+                    ),
+                  )
+                  .toList(),
+            )
+          : null,
+    );
+  }
 }
 
 class GlobalSearchPage extends StatefulWidget {
@@ -5060,110 +5334,216 @@ class DashboardPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = controller.summary;
     final demo = !controller.api.configured;
+    final canReport = controller.can('reporting.read');
+    final today = MaterialLocalizations.of(context)
+        .formatFullDate(DateTime.now());
+    num metric(String camel, String snake, [num fallback = 0]) =>
+        num.tryParse('${s[camel] ?? s[snake] ?? fallback}') ?? fallback;
     final cards = [
       (
         'الأعضاء النشطون',
-        '${s['activeMembers'] ?? (demo ? 1284 : 0)}',
+        '${metric('activeMembers', 'active_members', demo ? 1284 : 0)}',
         Icons.people_alt_outlined,
         Colors.blue,
       ),
       (
         'الاشتراكات النشطة',
-        '${s['activeSubscriptions'] ?? (demo ? 946 : 0)}',
+        '${metric('activeSubscriptions', 'active_subscriptions', demo ? 946 : 0)}',
         Icons.credit_card_outlined,
         Colors.purple,
       ),
       (
         'دخول اليوم',
-        '${s['acceptedAttendance'] ?? (demo ? 312 : 0)}',
+        '${metric('acceptedAttendance', 'accepted_attendance', demo ? 312 : 0)}',
         Icons.login_rounded,
         Colors.green,
       ),
       (
         'إيرادات اليوم',
-        _money(s['invoicedGrossMinor'] ?? (demo ? 186400 : 0)),
+        _money(
+          metric('invoicedGrossMinor', 'invoiced_gross_minor') +
+              metric(
+                'otherIncomeMinor',
+                'other_income_minor',
+                demo ? 186400 : 0,
+              ),
+        ),
         Icons.payments_outlined,
         goYellow,
       ),
     ];
     return PageFrame(
       onRefresh: () => controller.refresh(announce: true),
-      title: 'صباح الخير 👋',
-      subtitle: 'نظرة سريعة على أداء فرعك اليوم • الأحد، ١٣ سبتمبر ٢٠٢٦',
+      title: 'مرحبًا، ${controller.displayName}',
+      subtitle: '$today  •  ${controller.branchName}',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Wrap(
-            spacing: 12,
-            runSpacing: 12,
-            children: cards
-                .map(
-                  (c) => SizedBox(
-                    width: 235,
-                    child: MetricCard(
-                      label: c.$1,
-                      value: c.$2,
-                      icon: c.$3,
-                      color: c.$4,
+          if (!canReport) ...[
+            _AccessWelcomeCard(controller: controller),
+            const SizedBox(height: 16),
+            _quickCard(context, controller),
+          ] else if (controller.refreshing && s.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 100),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else ...[
+            if (controller.dashboardError != null)
+              _InlineError(
+                message: controller.dashboardError!,
+                onRetry: controller.refresh,
+              ),
+            if (controller.dashboardError != null) const SizedBox(height: 14),
+            Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: cards
+                  .map(
+                    (c) => SizedBox(
+                      width: 235,
+                      child: MetricCard(
+                        label: c.$1,
+                        value: c.$2,
+                        icon: c.$3,
+                        color: c.$4,
+                      ),
                     ),
-                  ),
-                )
-                .toList(),
-          ),
-          const SizedBox(height: 16),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(18),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const SectionHeader(
-                    title: 'أداء الإيرادات',
-                    action: 'آخر ٧ أيام',
-                  ),
-                  const SizedBox(height: 18),
-                  const SizedBox(height: 170, child: RevenueBars()),
-                  const SizedBox(height: 12),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children:
-                        [
-                              'السبت',
-                              'الأحد',
-                              'الإثنين',
-                              'الثلاثاء',
-                              'الأربعاء',
-                              'الخميس',
-                              'الجمعة',
-                            ]
-                            .map(
-                              (e) =>
-                                  Text(e, style: const TextStyle(fontSize: 10)),
-                            )
-                            .toList(),
-                  ),
-                ],
+                  )
+                  .toList(),
+            ),
+            const SizedBox(height: 16),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const SectionHeader(
+                      title: 'أداء الإيرادات',
+                      action: 'آخر ٣٠ يومًا',
+                    ),
+                    const SizedBox(height: 18),
+                    if (controller.analyticsError != null)
+                      _InlineError(
+                        message: controller.analyticsError!,
+                        onRetry: controller.refresh,
+                        compact: true,
+                      )
+                    else if (controller.revenue.isEmpty)
+                      const SizedBox(
+                        height: 150,
+                        child: Center(
+                          child: Text(
+                            'لا توجد حركة إيرادات في الفترة الحالية.',
+                          ),
+                        ),
+                      )
+                    else
+                      SizedBox(
+                        height: 190,
+                        child: RevenueBars(rows: controller.revenue),
+                      ),
+                  ],
+                ),
               ),
             ),
+            const SizedBox(height: 16),
+            LayoutBuilder(
+              builder: (context, c) => c.maxWidth < 650
+                  ? Column(
+                      children: [
+                        _quickCard(context, controller),
+                        const SizedBox(height: 16),
+                        _attentionCard(s, demo: demo),
+                      ],
+                    )
+                  : Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(child: _quickCard(context, controller)),
+                        const SizedBox(width: 16),
+                        Expanded(child: _attentionCard(s, demo: demo)),
+                      ],
+                    ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _AccessWelcomeCard extends StatelessWidget {
+  const _AccessWelcomeCard({required this.controller});
+  final GoController controller;
+
+  @override
+  Widget build(BuildContext context) => Card(
+    child: Padding(
+      padding: const EdgeInsets.all(20),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const CircleAvatar(
+            backgroundColor: goYellow,
+            child: Icon(Icons.verified_user_outlined, color: goInk),
           ),
-          const SizedBox(height: 16),
-          LayoutBuilder(
-            builder: (context, c) => c.maxWidth < 650
-                ? Column(
-                    children: [
-                      _quickCard(context, controller),
-                      const SizedBox(height: 16),
-                      _attentionCard(s, demo: demo),
-                    ],
-                  )
-                : Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(child: _quickCard(context, controller)),
-                      const SizedBox(width: 16),
-                      Expanded(child: _attentionCard(s, demo: demo)),
-                    ],
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'مساحة عملك جاهزة',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'تظهر لك الأدوات المسموح بها حسب دورك في ${controller.branchName}. استخدم الإجراءات السريعة أو تبويب المزيد للوصول إليها.',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    height: 1.6,
                   ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _InlineError extends StatelessWidget {
+  const _InlineError({
+    required this.message,
+    required this.onRetry,
+    this.compact = false,
+  });
+  final String message;
+  final Future<void> Function() onRetry;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Container(
+      padding: EdgeInsets.all(compact ? 12 : 15),
+      decoration: BoxDecoration(
+        color: colors.errorContainer.withValues(alpha: .5),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: colors.error.withValues(alpha: .25)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.error_outline_rounded, color: colors.error),
+          const SizedBox(width: 10),
+          Expanded(child: Text(message, style: const TextStyle(height: 1.5))),
+          IconButton(
+            onPressed: () => unawaited(onRetry()),
+            tooltip: 'إعادة المحاولة',
+            icon: const Icon(Icons.refresh_rounded),
           ),
         ],
       ),
@@ -5207,39 +5587,44 @@ Widget _quickCard(BuildContext context, GoController controller) => Card(
     ),
   ),
 );
-Widget _attentionCard(Map<String, dynamic> s, {required bool demo}) => Card(
-  child: Padding(
-    padding: const EdgeInsets.all(18),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        SectionHeader(
-          title: 'يحتاج انتباهك',
-          action: '${s['pendingOnlineRequests'] ?? (demo ? 7 : 0)} طلبات',
-        ),
-        const SizedBox(height: 12),
-        AttentionRow(
-          icon: Icons.person_add_alt_rounded,
-          title: 'طلبات انضمام جديدة',
-          value: '${s['pendingOnlineRequests'] ?? (demo ? 7 : 0)}',
-          color: Colors.orange,
-        ),
-        AttentionRow(
-          icon: Icons.chat_bubble_outline_rounded,
-          title: 'شكاوى مفتوحة',
-          value: '${s['openFeedbackCases'] ?? (demo ? 3 : 0)}',
-          color: Colors.red,
-        ),
-        AttentionRow(
-          icon: Icons.event_available_outlined,
-          title: 'حجوزات اليوم',
-          value: '${s['todayReservations'] ?? (demo ? 24 : 0)}',
-          color: Colors.blue,
-        ),
-      ],
+Widget _attentionCard(Map<String, dynamic> s, {required bool demo}) {
+  String value(String camel, String snake, num fallback) =>
+      '${s[camel] ?? s[snake] ?? fallback}';
+  final pending = value(
+    'pendingOnlineRequests',
+    'pending_online_requests',
+    demo ? 7 : 0,
+  );
+  final feedback = value(
+    'openFeedbackCases',
+    'open_feedback_cases',
+    demo ? 3 : 0,
+  );
+  return Card(
+    child: Padding(
+      padding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SectionHeader(title: 'يحتاج انتباهك', action: '$pending طلبات'),
+          const SizedBox(height: 12),
+          AttentionRow(
+            icon: Icons.person_add_alt_rounded,
+            title: 'طلبات انضمام جديدة',
+            value: pending,
+            color: Colors.orange,
+          ),
+          AttentionRow(
+            icon: Icons.chat_bubble_outline_rounded,
+            title: 'شكاوى مفتوحة',
+            value: feedback,
+            color: Colors.red,
+          ),
+        ],
+      ),
     ),
-  ),
-);
+  );
+}
 
 class MetricCard extends StatelessWidget {
   const MetricCard({
@@ -5291,28 +5676,69 @@ class MetricCard extends StatelessWidget {
 }
 
 class RevenueBars extends StatelessWidget {
-  const RevenueBars({super.key});
+  const RevenueBars({super.key, required this.rows});
+  final List<Map<String, dynamic>> rows;
+
   @override
-  Widget build(BuildContext context) => Row(
-    crossAxisAlignment: CrossAxisAlignment.end,
-    mainAxisAlignment: MainAxisAlignment.spaceAround,
-    children: [0.42, .68, .55, .82, .63, .9, .74]
-        .map(
-          (v) => Flexible(
-            child: FractionallySizedBox(
-              heightFactor: v,
-              child: Container(
-                margin: const EdgeInsets.symmetric(horizontal: 5),
-                decoration: BoxDecoration(
-                  color: goYellow,
-                  borderRadius: BorderRadius.circular(7),
-                ),
+  Widget build(BuildContext context) {
+    final visible = rows.length > 10 ? rows.sublist(rows.length - 10) : rows;
+    num amount(Map<String, dynamic> row) =>
+        num.tryParse(
+          '${row['totalRevenueMinor'] ?? row['total_revenue_minor'] ?? 0}',
+        ) ??
+        0;
+    final maximum = visible.map(amount).fold<num>(0, max);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: visible.map((row) {
+        final value = amount(row);
+        final ratio = maximum <= 0 ? 0.0 : (value / maximum).toDouble();
+        final date = '${row['businessDate'] ?? row['business_date'] ?? ''}';
+        final label = date.length >= 10
+            ? '${date.substring(8, 10)}/${date.substring(5, 7)}'
+            : date;
+        return Expanded(
+          child: Tooltip(
+            message: '$label • ${_money(value)}',
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 3),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  Text(
+                    _compactMoney(value),
+                    maxLines: 1,
+                    overflow: TextOverflow.fade,
+                    style: const TextStyle(fontSize: 9),
+                  ),
+                  const SizedBox(height: 5),
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 350),
+                    height: 12 + (112 * ratio),
+                    decoration: BoxDecoration(
+                      color: goYellow,
+                      borderRadius: const BorderRadius.vertical(
+                        top: Radius.circular(7),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(label, style: const TextStyle(fontSize: 9)),
+                ],
               ),
             ),
           ),
-        )
-        .toList(),
-  );
+        );
+      }).toList(),
+    );
+  }
+}
+
+String _compactMoney(num minor) {
+  final riyals = minor / 100;
+  if (riyals >= 1000000) return '${(riyals / 1000000).toStringAsFixed(1)}م';
+  if (riyals >= 1000) return '${(riyals / 1000).toStringAsFixed(1)}ألف';
+  return riyals.toStringAsFixed(0);
 }
 
 class SectionHeader extends StatelessWidget {
@@ -5321,18 +5747,26 @@ class SectionHeader extends StatelessWidget {
   final String? action;
   @override
   Widget build(BuildContext context) => Row(
-    mainAxisAlignment: MainAxisAlignment.spaceBetween,
     children: [
-      Text(
-        title,
-        style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16),
+      Expanded(
+        child: Text(
+          title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16),
+        ),
       ),
       if (action != null)
-        Text(
-          action!,
-          style: TextStyle(
-            fontSize: 11,
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
+        Flexible(
+          child: Text(
+            action!,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.end,
+            style: TextStyle(
+              fontSize: 11,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
           ),
         ),
     ],
@@ -5399,77 +5833,182 @@ class MembersPage extends StatefulWidget {
 
 class _MembersPageState extends State<MembersPage> {
   String query = '';
+  final searchController = TextEditingController();
+
+  @override
+  void dispose() {
+    searchController.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     final source = widget.controller.api.configured
         ? widget.controller.members
         : widget.controller.demoMembers;
+    final normalizedQuery = query.trim().toLowerCase();
     final rows = source
         .where(
           (m) =>
-              m['name'].toString().contains(query) ||
-              (m['memberNumber'] ?? m['number']).toString().contains(query),
+              m['name'].toString().toLowerCase().contains(normalizedQuery) ||
+              (m['memberNumber'] ?? m['number'])
+                  .toString()
+                  .toLowerCase()
+                  .contains(normalizedQuery),
         )
         .toList();
-    return PageFrame(
+    final initialLoading = widget.controller.refreshing && source.isEmpty;
+    final loadError = widget.controller.membersError;
+    return RefreshIndicator(
       onRefresh: widget.controller.refresh,
-      title: 'دليل الأعضاء',
-      subtitle: 'ابحث في ملفات الأعضاء وتابع حالة العضوية والاشتراكات.',
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  onChanged: (v) => setState(() => query = v),
-                  decoration: const InputDecoration(
-                    hintText: 'ابحث بالاسم أو رقم العضوية...',
-                    prefixIcon: Icon(Icons.search_rounded),
+      child: CustomScrollView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        slivers: [
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(18, 18, 18, 12),
+            sliver: SliverToBoxAdapter(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'دليل الأعضاء',
+                    style: TextStyle(fontSize: 26, fontWeight: FontWeight.w900),
                   ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              FilledButton.icon(
-                onPressed: () =>
-                    unawaited(_openNewMemberSheet(context, widget.controller)),
-                icon: const Icon(Icons.add, size: 18),
-                label: const Text('عضو جديد'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 14),
-          Card(
-            child: Column(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  const SizedBox(height: 5),
+                  Text(
+                    'ابحث في الملفات وتابع حالة العضوية والاشتراكات بسرعة.',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      height: 1.6,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final search = TextField(
+                        controller: searchController,
+                        onChanged: (value) => setState(() => query = value),
+                        decoration: InputDecoration(
+                          hintText: 'الاسم أو رقم العضوية',
+                          prefixIcon: const Icon(Icons.search_rounded),
+                          suffixIcon: query.isEmpty
+                              ? null
+                              : IconButton(
+                                  tooltip: 'مسح البحث',
+                                  onPressed: () {
+                                    searchController.clear();
+                                    setState(() => query = '');
+                                  },
+                                  icon: const Icon(Icons.close_rounded),
+                                ),
+                        ),
+                      );
+                      final add = FilledButton.icon(
+                        onPressed: () => unawaited(
+                          _openNewMemberSheet(context, widget.controller),
+                        ),
+                        icon: const Icon(Icons.person_add_alt_1_rounded),
+                        label: const Text('عضو جديد'),
+                      );
+                      if (constraints.maxWidth < 520) {
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            search,
+                            if (widget.controller.can('members.manage')) ...[
+                              const SizedBox(height: 10),
+                              add,
+                            ],
+                          ],
+                        );
+                      }
+                      return Row(
+                        children: [
+                          Expanded(child: search),
+                          if (widget.controller.can('members.manage')) ...[
+                            const SizedBox(width: 10),
+                            add,
+                          ],
+                        ],
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 14),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
                     children: [
-                      Text(
-                        '${rows.length} أعضاء ظاهرون',
-                        style: const TextStyle(fontWeight: FontWeight.w800),
+                      Chip(
+                        avatar: const Icon(Icons.people_alt_outlined, size: 17),
+                        label: Text('${rows.length} عضو'),
                       ),
-                      Text(
-                        widget.controller.api.configured
-                            ? widget.controller.branchName
-                            : 'وضع العرض',
-                        style: TextStyle(
-                          color: Colors.amber[800],
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
+                      Chip(
+                        avatar: const Icon(
+                          Icons.location_on_outlined,
+                          size: 17,
+                        ),
+                        label: Text(
+                          widget.controller.api.configured
+                              ? widget.controller.branchName
+                              : 'وضع العرض',
                         ),
                       ),
                     ],
                   ),
-                ),
-                const Divider(height: 1),
-                ...rows.map(
-                  (m) => MemberTile(controller: widget.controller, member: m),
-                ),
-              ],
+                  if (widget.controller.refreshing && source.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    const LinearProgressIndicator(minHeight: 2),
+                  ],
+                ],
+              ),
             ),
           ),
+          if (initialLoading)
+            const SliverFillRemaining(
+              hasScrollBody: false,
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (loadError != null && source.isEmpty)
+            SliverFillRemaining(
+              hasScrollBody: false,
+              child: _ResourceMessage(
+                icon: Icons.cloud_off_outlined,
+                title: 'تعذر تحميل الأعضاء',
+                body: loadError,
+                action: widget.controller.refresh,
+              ),
+            )
+          else if (rows.isEmpty)
+            SliverFillRemaining(
+              hasScrollBody: false,
+              child: _ResourceMessage(
+                icon: query.isEmpty
+                    ? Icons.people_outline_rounded
+                    : Icons.search_off_rounded,
+                title: query.isEmpty
+                    ? 'لا يوجد أعضاء في هذا الفرع'
+                    : 'لا توجد نتائج',
+                body: query.isEmpty
+                    ? 'اسحب لأسفل لتحديث القائمة أو أضف أول عضو إذا كانت لديك الصلاحية.'
+                    : 'جرّب البحث باسم آخر أو امسح عبارة البحث.',
+              ),
+            )
+          else
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(18, 0, 18, 30),
+              sliver: SliverList.builder(
+                itemCount: rows.length,
+                itemBuilder: (context, index) => Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Card(
+                    child: MemberTile(
+                      controller: widget.controller,
+                      member: rows[index],
+                    ),
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -5581,7 +6120,7 @@ class _MemberDetailPageState extends State<MemberDetailPage> {
       if (data is Map) member = Map<String, dynamic>.from(data);
       error = null;
     } catch (exception) {
-      error = exception.toString().replaceFirst('Exception: ', '');
+      error = _errorMessage(exception);
     }
     if (mounted) setState(() => loading = false);
   }
@@ -5855,109 +6394,202 @@ class _MemberDetailPageState extends State<MemberDetailPage> {
   }
 }
 
-class OperationsPage extends StatelessWidget {
+class OperationsPage extends StatefulWidget {
   const OperationsPage({super.key, required this.controller});
   final GoController controller;
+
   @override
-  Widget build(BuildContext context) => PageFrame(
-    title: 'مركز التشغيل',
-    subtitle: 'الحضور والحجوزات والاشتراكات في شاشة واحدة سريعة.',
-    child: Column(
-      children: [
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const SectionHeader(title: 'الوصول السريع'),
-                const SizedBox(height: 14),
-                Wrap(
-                  spacing: 10,
-                  runSpacing: 10,
-                  children: [
-                    if (controller.can('attendance.check-in'))
-                      OperationButton(
-                        icon: Icons.qr_code_scanner_rounded,
-                        title: 'مسح دخول',
-                        color: Colors.green,
-                        onPressed: () =>
-                            unawaited(_openCheckInSheet(context, controller)),
-                      ),
-                    if (controller.can('bookings.create'))
-                      OperationButton(
-                        icon: Icons.calendar_month_outlined,
-                        title: 'حجز مورد',
-                        color: Colors.blue,
-                        onPressed: () => unawaited(
-                          _openWorkflow(
-                            context,
-                            controller,
-                            _workflowById('createManualReservation'),
+  State<OperationsPage> createState() => _OperationsPageState();
+}
+
+class _OperationsPageState extends State<OperationsPage> {
+  List<Map<String, dynamic>> schedule = [];
+  bool loading = true;
+  String? error;
+  String? loadedBranch;
+
+  GoController get controller => widget.controller;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(load());
+  }
+
+  @override
+  void didUpdateWidget(covariant OperationsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (loadedBranch != controller.branchId && !loading) unawaited(load());
+  }
+
+  Future<void> load() async {
+    if (mounted) {
+      setState(() {
+        loading = true;
+        error = null;
+      });
+    }
+    final rows = <Map<String, dynamic>>[];
+    final errors = <String>[];
+    Future<void> fetch(ResourceFeature feature, String kind) async {
+      try {
+        final result = controller.api.configured
+            ? await controller.api.listResource(
+                controller.organizationId,
+                controller.branchId,
+                feature.path,
+              )
+            : _demoResourceRows(feature);
+        for (final row in result) {
+          rows.add({...row, '_scheduleKind': kind});
+        }
+      } catch (exception) {
+        errors.add(_errorMessage(exception));
+      }
+    }
+
+    await Future.wait<void>([
+      if (controller.can('bookings.read'))
+        fetch(resourceFeatures[2], 'booking'),
+      if (controller.can('workforce.shifts.read'))
+        fetch(
+          resourceFeatures.firstWhere(
+            (item) => item.path.endsWith('/employee-shifts'),
+          ),
+          'shift',
+        ),
+    ]);
+    rows.sort((a, b) => _scheduleDate(a).compareTo(_scheduleDate(b)));
+    if (!mounted) return;
+    setState(() {
+      schedule = rows;
+      loadedBranch = controller.branchId;
+      loading = false;
+      error = errors.isEmpty ? null : errors.first;
+    });
+  }
+
+  static DateTime _scheduleDate(Map<String, dynamic> row) =>
+      DateTime.tryParse('${row['startsAt'] ?? row['starts_at'] ?? ''}') ??
+      DateTime.fromMillisecondsSinceEpoch(0);
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final today = schedule.where((row) {
+      final date = _scheduleDate(row).toLocal();
+      return date.year == now.year &&
+          date.month == now.month &&
+          date.day == now.day;
+    }).toList();
+    return PageFrame(
+      onRefresh: load,
+      title: 'مركز التشغيل',
+      subtitle: 'إجراءات الفرع وجدول اليوم من البيانات الفعلية.',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const SectionHeader(title: 'الوصول السريع'),
+                  const SizedBox(height: 14),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      if (controller.can('attendance.check-in'))
+                        OperationButton(
+                          icon: Icons.qr_code_scanner_rounded,
+                          title: 'مسح دخول',
+                          color: Colors.green,
+                          onPressed: () =>
+                              unawaited(_openCheckInSheet(context, controller)),
+                        ),
+                      if (controller.can('bookings.create'))
+                        OperationButton(
+                          icon: Icons.calendar_month_outlined,
+                          title: 'حجز مورد',
+                          color: Colors.blue,
+                          onPressed: () => unawaited(
+                            _openWorkflow(
+                              context,
+                              controller,
+                              _workflowById('createManualReservation'),
+                            ),
                           ),
                         ),
-                      ),
-                    if (controller.can('finance.invoices.read'))
-                      OperationButton(
-                        icon: Icons.point_of_sale_outlined,
-                        title: 'نقطة البيع',
-                        color: Colors.orange,
-                        onPressed: () => _openResource(
-                          context,
-                          controller,
-                          resourceFeatures[3],
+                      if (controller.can('finance.invoices.read'))
+                        OperationButton(
+                          icon: Icons.point_of_sale_outlined,
+                          title: 'نقطة البيع',
+                          color: Colors.orange,
+                          onPressed: () => _openResource(
+                            context,
+                            controller,
+                            resourceFeatures[3],
+                          ),
                         ),
-                      ),
-                    if (controller.can('restaurant.orders.read'))
-                      OperationButton(
-                        icon: Icons.restaurant_outlined,
-                        title: 'طلبات المطعم',
-                        color: Colors.purple,
-                        onPressed: () => _openResource(
-                          context,
-                          controller,
-                          resourceFeatures[6],
+                      if (controller.can('restaurant.orders.read'))
+                        OperationButton(
+                          icon: Icons.restaurant_outlined,
+                          title: 'طلبات المطعم',
+                          color: Colors.purple,
+                          onPressed: () => _openResource(
+                            context,
+                            controller,
+                            resourceFeatures[6],
+                          ),
                         ),
-                      ),
-                  ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          Card(
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(18),
+                  child: SectionHeader(
+                    title: 'جدول اليوم',
+                    action: loading ? 'جارٍ التحميل' : '${today.length} موعد',
+                  ),
                 ),
+                const Divider(height: 1),
+                if (loading)
+                  const Padding(
+                    padding: EdgeInsets.all(38),
+                    child: CircularProgressIndicator(),
+                  )
+                else if (error != null && today.isEmpty)
+                  _ResourceMessage(
+                    icon: Icons.cloud_off_outlined,
+                    title: 'تعذر تحميل جدول اليوم',
+                    body: error!,
+                    action: load,
+                  )
+                else if (today.isEmpty)
+                  const _ResourceMessage(
+                    icon: Icons.event_available_outlined,
+                    title: 'لا توجد مواعيد اليوم',
+                    body:
+                        'لا توجد حجوزات أو مناوبات مسجلة لهذا اليوم في الفرع.',
+                  )
+                else
+                  ...today.map((row) => _OperationScheduleRow(row: row)),
               ],
             ),
           ),
-        ),
-        const SizedBox(height: 14),
-        Card(
-          child: Column(
-            children: [
-              const Padding(
-                padding: EdgeInsets.all(18),
-                child: SectionHeader(title: 'جدول اليوم', action: '٢٤ حجزاً'),
-              ),
-              const Divider(height: 1),
-              const ScheduleRow(
-                time: '٠٩:٠٠',
-                title: 'حصة تدريب جماعي',
-                place: 'استوديو ١',
-                color: Colors.blue,
-              ),
-              const ScheduleRow(
-                time: '١١:٣٠',
-                title: 'جلسة تدريب شخصي',
-                place: 'منطقة التدريب',
-                color: Colors.purple,
-              ),
-              const ScheduleRow(
-                time: '١٨:٠٠',
-                title: 'تقييم لياقة بدنية',
-                place: 'قاعة القياسات',
-                color: Colors.orange,
-              ),
-            ],
-          ),
-        ),
-      ],
-    ),
-  );
+        ],
+      ),
+    );
+  }
 }
 
 class OperationButton extends StatelessWidget {
@@ -5980,37 +6612,44 @@ class OperationButton extends StatelessWidget {
   );
 }
 
-class ScheduleRow extends StatelessWidget {
-  const ScheduleRow({
-    super.key,
-    required this.time,
-    required this.title,
-    required this.place,
-    required this.color,
-  });
-  final String time, title, place;
-  final Color color;
+class _OperationScheduleRow extends StatelessWidget {
+  const _OperationScheduleRow({required this.row});
+  final Map<String, dynamic> row;
+
   @override
-  Widget build(BuildContext context) => ListTile(
-    contentPadding: const EdgeInsets.symmetric(horizontal: 18),
-    leading: SizedBox(
-      width: 48,
-      child: Text(time, style: const TextStyle(fontWeight: FontWeight.w900)),
-    ),
-    title: Text(
-      title,
-      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-    ),
-    subtitle: Text(place, style: const TextStyle(fontSize: 11)),
-    trailing: Container(
-      width: 8,
-      height: 35,
-      decoration: BoxDecoration(
-        color: color,
-        borderRadius: BorderRadius.circular(8),
+  Widget build(BuildContext context) {
+    final isShift = row['_scheduleKind'] == 'shift';
+    final startsAt = _OperationsPageState._scheduleDate(row).toLocal();
+    final time = MaterialLocalizations.of(context)
+        .formatTimeOfDay(TimeOfDay.fromDateTime(startsAt));
+    final title = isShift
+        ? '${row['employeeName'] ?? row['employee_name'] ?? 'مناوبة موظف'}'
+        : '${row['customerName'] ?? row['memberName'] ?? row['resourceName'] ?? 'حجز'}';
+    final place = isShift
+        ? 'مناوبة • ${_displayValue('status', row['status'])}'
+        : '${row['resourceName'] ?? 'حجز'} • ${_displayValue('status', row['status'])}';
+    final color = isShift ? Colors.purple : Colors.blue;
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 18),
+      leading: SizedBox(
+        width: 48,
+        child: Text(time, style: const TextStyle(fontWeight: FontWeight.w900)),
       ),
-    ),
-  );
+      title: Text(
+        title,
+        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+      ),
+      subtitle: Text(place, style: const TextStyle(fontSize: 11)),
+      trailing: Container(
+        width: 8,
+        height: 35,
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+    );
+  }
 }
 
 class MessagesPage extends StatelessWidget {
@@ -6020,6 +6659,7 @@ class MessagesPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final unread = controller.notices.where((n) => n['unread'] == true).length;
     return PageFrame(
+      onRefresh: () => controller.refresh(announce: true),
       title: 'الرسائل والإشعارات',
       subtitle: unread == 0
           ? 'لا توجد رسائل جديدة.'
@@ -6030,20 +6670,38 @@ class MessagesPage extends StatelessWidget {
             Align(
               alignment: AlignmentDirectional.centerStart,
               child: TextButton.icon(
-                onPressed: () {
-                  controller.markAllRead();
-                },
+                onPressed: () => unawaited(controller.markAllRead()),
                 icon: const Icon(Icons.done_all, size: 16),
                 label: const Text('تحديد الكل كمقروء'),
               ),
             ),
-          Card(
-            child: Column(
-              children: controller.notices
-                  .map((n) => NoticeTile(notice: n, controller: controller))
-                  .toList(),
+          if (controller.refreshing && controller.notices.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 70),
+              child: CircularProgressIndicator(),
+            )
+          else if (controller.notificationsError != null &&
+              controller.notices.isEmpty)
+            _ResourceMessage(
+              icon: Icons.notifications_off_outlined,
+              title: 'تعذر تحميل التنبيهات',
+              body: controller.notificationsError!,
+              action: controller.refresh,
+            )
+          else if (controller.notices.isEmpty)
+            const _ResourceMessage(
+              icon: Icons.notifications_none_rounded,
+              title: 'كل شيء هادئ الآن',
+              body: 'ستظهر هنا تنبيهات الحساب والتحديثات المهمة عند وصولها.',
+            )
+          else
+            Card(
+              child: Column(
+                children: controller.notices
+                    .map((n) => NoticeTile(notice: n, controller: controller))
+                    .toList(),
+              ),
             ),
-          ),
         ],
       ),
     );
@@ -6195,7 +6853,11 @@ class _MemberDailyMenuPageState extends State<MemberDailyMenuPage> {
                 .toList()
           : [];
     } catch (exception) {
-      error = exception.toString().replaceFirst('Exception: ', '');
+      if (exception is ApiFailure && exception.isNotFound) {
+        meals = [];
+      } else {
+        error = _errorMessage(exception);
+      }
     }
     if (mounted) setState(() => loading = false);
   }
@@ -6406,8 +7068,12 @@ class _ResourcePageState extends State<ResourcePage> {
                   widget.memberFilterId ?? widget.controller.selectedMemberId,
             )
           : _demoResourceRows(widget.feature);
-    } catch (e) {
-      error = e.toString().replaceFirst('Exception: ', '');
+    } catch (exception) {
+      if (exception is ApiFailure && exception.isNotFound) {
+        rows = [];
+      } else {
+        error = _errorMessage(exception);
+      }
     }
     if (mounted) setState(() => loading = false);
   }
@@ -7251,6 +7917,18 @@ class MorePage extends StatelessWidget {
                     trailing: const Icon(Icons.chevron_left_rounded),
                   ),
                 ],
+                const Divider(height: 1),
+                SwitchListTile(
+                  value: controller.darkMode,
+                  onChanged: (_) => controller.toggleTheme(),
+                  secondary: Icon(
+                    controller.darkMode
+                        ? Icons.dark_mode_outlined
+                        : Icons.light_mode_outlined,
+                  ),
+                  title: const Text('المظهر الداكن'),
+                  subtitle: const Text('يتبع اختيارك داخل التطبيق'),
+                ),
               ],
             ),
           ),
@@ -7343,10 +8021,7 @@ class MorePage extends StatelessWidget {
             mainAxisSpacing: 10,
             childAspectRatio: 1.35,
             children: resourceFeatures
-                .where((feature) {
-                  final permission = _featurePermission(feature.path);
-                  return permission == null || controller.can(permission);
-                })
+                .where((feature) => _canViewFeature(controller, feature))
                 .map(
                   (f) => Card(
                     child: InkWell(
@@ -9060,15 +9735,16 @@ String? _featurePermission(String path) {
     return 'bookings.read';
   }
   if (path.contains('/invoices')) return 'finance.invoices.read';
+  if (path.contains('/restaurant-orders')) return 'restaurant.orders.read';
+  if (path.endsWith('/orders')) return 'sales.read';
   if (path.contains('/payments') || path.contains('/refund')) {
     return 'finance.payments.read';
   }
-  if (path.contains('/cash-')) return 'finance.cash-points.read';
+  if (path.contains('/cash-points')) return 'finance.cash-points.read';
   if (path.contains('/expenses')) return 'finance.expenses.read';
   if (path.contains('/other-income')) return 'finance.other-income.read';
   if (path.contains('/crm/leads')) return 'crm.leads.read';
   if (path.contains('/crm/follow-ups')) return 'crm.follow-ups.read';
-  if (path.contains('/restaurant-orders')) return 'restaurant.orders.read';
   if (path.contains('/restaurant/')) return 'restaurant.catalog.read';
   if (path.contains('/retail/inventory')) return 'retail.inventory.read';
   if (path.contains('/retail/')) return 'retail.catalog.read';
@@ -9092,18 +9768,19 @@ String? _featurePermission(String path) {
   if (path.contains('/notification-template')) {
     return 'notification-templates.read';
   }
-  if (path.contains('/notification') ||
-      path.contains('/communication') ||
-      path.contains('/whatsapp')) {
+  if (path.contains('/whatsapp')) return 'notifications.whatsapp.read';
+  if (path.contains('/notification') || path.contains('/communication')) {
     return 'notifications.read';
   }
   if (path.contains('/audit')) return 'iam.audit.read';
   if (path.contains('/roles')) return 'iam.roles.read';
+  if (path.contains('/permissions')) return 'iam.roles.read';
   if (path.contains('/user-accounts') || path.contains('/role-assignments')) {
     return 'iam.accounts.read';
   }
   if (path.contains('/branches')) return 'branch.read';
   if (path.contains('/activities') ||
+      path.contains('/service-categories') ||
       path.contains('/services') ||
       path.contains('/packages')) {
     return 'catalog.read';
@@ -9113,7 +9790,22 @@ String? _featurePermission(String path) {
       path.contains('/commercial-policies')) {
     return 'commercial.read';
   }
+  if (path.contains('/crm/lead-sources')) return 'crm.leads.read';
   return null;
+}
+
+bool _canViewFeature(GoController controller, ResourceFeature feature) {
+  final path = feature.path;
+  if (path.contains('/cashier-shifts')) {
+    return controller.can('finance.cash-shifts.manage') ||
+        controller.can('finance.cash-shifts.audit.read');
+  }
+  if (path.contains('/permissions')) {
+    return controller.can('iam.roles.read') ||
+        controller.can('workforce.manage');
+  }
+  final permission = _featurePermission(path);
+  return permission == null || controller.can(permission);
 }
 
 Future<void> _openNewMemberSheet(
