@@ -91,6 +91,16 @@ String _errorMessage(Object exception) => exception is ApiFailure
     ? exception.message
     : exception.toString().replaceFirst('Exception: ', '');
 
+String apiProblemMessage(String? code, String fallback) {
+  return switch (code) {
+    'daily_menu_price_missing' => 'لا يمكن نشر القائمة لأن إحدى الوجبات بلا سعر ساري في هذا الفرع وتاريخ القائمة. أضف السعر أو صحح بداية سريانه ثم أعد المحاولة.',
+    'daily_menu_already_exists' => 'توجد قائمة لهذا اليوم بالفعل. افتح القائمة الحالية وعدّلها بدل إنشاء قائمة جديدة.',
+    'version_conflict' =>
+      'تم تحديث السجل من جهاز آخر. حدّث البيانات ثم أعد المحاولة.',
+    _ => fallback,
+  };
+}
+
 void main() => runApp(const GoMobileApp());
 
 class MobileNotificationService {
@@ -257,7 +267,11 @@ class ApiClient {
           code = problem['code']?.toString();
         }
       } catch (_) {}
-      throw ApiFailure(message, statusCode: response.statusCode, code: code);
+      throw ApiFailure(
+        apiProblemMessage(code, message),
+        statusCode: response.statusCode,
+        code: code,
+      );
     }
     if (response.statusCode == 204 || response.body.isEmpty) return null;
     final decoded = jsonDecode(response.body);
@@ -903,6 +917,51 @@ final mobileWorkflows = <MobileWorkflow>[
             'promoCode': values['promoCode'],
         },
       ],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'rescheduleSubscriptionStart',
+    title: 'تغيير تاريخ بدء اشتراك',
+    description: 'متاح فقط للاشتراكات التي لم تبدأ بعد، ويعيد النظام حساب نهاية المدة وفترات الدخول تلقائيًا.',
+    submitLabel: 'حفظ تاريخ البداية الجديد',
+    successMessage: 'تم تغيير تاريخ بدء الاشتراك.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/subscriptions/{subscriptionId}/start-date-changes',
+    icon: Icons.edit_calendar_outlined,
+    fields: [
+      WorkflowField(
+        name: 'subscriptionId',
+        label: 'الاشتراك الذي لم يبدأ',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/subscriptions',
+        labelKeys: ['memberName', 'packageName', 'subscriptionNumber'],
+        subtitleKeys: ['status', 'termStart'],
+        copyValues: {'expectedVersion': 'version'},
+      ),
+      WorkflowField(
+        name: 'expectedVersion',
+        label: 'إصدار السجل',
+        type: WorkflowFieldType.hidden,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'startAt',
+        label: 'تاريخ ووقت البداية الجديد',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'reason',
+        label: 'سبب التغيير',
+        type: WorkflowFieldType.textarea,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'expectedVersion': int.tryParse(values['expectedVersion'] ?? '') ?? 1,
+      'startAt': _asIso(values['startAt']),
+      'reason': values['reason']?.trim(),
     },
   ),
   MobileWorkflow(
@@ -1731,6 +1790,66 @@ final mobileWorkflows = <MobileWorkflow>[
     },
   ),
   MobileWorkflow(
+    operationId: 'assignEmployee',
+    title: 'إضافة تعيين وظيفي',
+    description: 'انقل الموظف أو أضف له تعيينًا جديدًا في فرع ومسمى مع فترة سريان واضحة.',
+    submitLabel: 'حفظ التعيين الوظيفي',
+    successMessage: 'تم حفظ تعيين الموظف.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/employees/{employeeId}/assignments',
+    icon: Icons.assignment_ind_outlined,
+    fields: [
+      WorkflowField(
+        name: 'employeeId',
+        label: 'الموظف',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/employees',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['employeeNumber', 'positionName'],
+      ),
+      WorkflowField(
+        name: 'positionId',
+        label: 'المسمى الوظيفي',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/positions',
+        labelKeys: ['name'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'branchId',
+        label: 'الفرع',
+        type: WorkflowFieldType.reference,
+        required: true,
+        initialValue: '',
+        referencePath: '/organizations/{organizationId}/branches',
+        labelKeys: ['name', 'nameAr'],
+        subtitleKeys: ['code'],
+      ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'بداية التعيين (اختياري)',
+        type: WorkflowFieldType.dateTime,
+        autoFillDate: false,
+      ),
+      WorkflowField(
+        name: 'validUntil',
+        label: 'نهاية التعيين (اختياري)',
+        type: WorkflowFieldType.dateTime,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'positionId': values['positionId'],
+      'branchId': values['branchId'],
+      if (values['validFrom']?.isNotEmpty == true)
+        'validFrom': _asIso(values['validFrom']),
+      if (values['validUntil']?.isNotEmpty == true)
+        'validUntil': _asIso(values['validUntil']),
+    },
+  ),
+  MobileWorkflow(
     operationId: 'recordSelfTrainerMeasurement',
     title: 'تسجيل قياس للمتدرب',
     description: 'اختر العضو ونوع القياس وسجّل القيمة كما ظهرت في الجهاز.',
@@ -2353,10 +2472,12 @@ final mobileWorkflows = <MobileWorkflow>[
       ),
       WorkflowField(
         name: 'capacity',
-        label: 'سعة الحجوزات',
+        label: 'سعة الحصة الجماعية',
         type: WorkflowFieldType.number,
         required: true,
         initialValue: '1',
+        visibleWhenField: 'type',
+        visibleWhenValues: ['CLASS'],
       ),
     ],
     body: (values, controller) => {
@@ -2367,7 +2488,226 @@ final mobileWorkflows = <MobileWorkflow>[
       'code': values['code']?.trim().toUpperCase(),
       'name': values['name']?.trim(),
       'type': values['type'],
-      'capacity': int.tryParse(values['capacity'] ?? '') ?? 1,
+      'capacity': values['type'] == 'CLASS'
+          ? int.tryParse(values['capacity'] ?? '') ?? 1
+          : 1,
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'scheduleServiceAvailability',
+    title: 'تفعيل خدمة في فرع',
+    description: 'حدد الخدمة وفترة إتاحتها في الفرع الحالي. يمكن أيضًا جدولة إيقافها من التاريخ المحدد.',
+    submitLabel: 'حفظ إتاحة الخدمة',
+    successMessage: 'تم حفظ إتاحة الخدمة في الفرع.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/services/{serviceId}/availabilities',
+    icon: Icons.event_available_outlined,
+    fields: [
+      WorkflowField(
+        name: 'serviceId',
+        label: 'الخدمة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/services',
+        labelKeys: ['name'],
+        subtitleKeys: ['code', 'status'],
+      ),
+      WorkflowField(
+        name: 'enabled',
+        label: 'الخدمة متاحة للبيع والحجز',
+        type: WorkflowFieldType.checkbox,
+        initialValue: 'true',
+      ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'بداية السريان',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'validUntil',
+        label: 'نهاية السريان (اختياري)',
+        type: WorkflowFieldType.dateTime,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'enabled': _checked(values['enabled']),
+      'validFrom': _asIso(values['validFrom']),
+      if (values['validUntil']?.isNotEmpty == true)
+        'validUntil': _asIso(values['validUntil']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createBookingAvailability',
+    title: 'إضافة ساعات إتاحة',
+    description: 'حدد أيام وساعات العمل الدورية لمورد الحجز في الفرع الحالي.',
+    submitLabel: 'حفظ ساعات الإتاحة',
+    successMessage: 'تمت إضافة ساعات إتاحة المورد.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/bookable-resources/{resourceId}/availability-rules',
+    icon: Icons.calendar_view_week_outlined,
+    fields: [
+      WorkflowField(
+        name: 'resourceId',
+        label: 'مورد الحجز',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/bookable-resources',
+        labelKeys: ['name'],
+        subtitleKeys: ['type', 'facilityName'],
+      ),
+      WorkflowField(
+        name: 'dayOfWeek',
+        label: 'اليوم',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: '0',
+        choices: [
+          WorkflowChoice('0', 'الأحد'),
+          WorkflowChoice('1', 'الاثنين'),
+          WorkflowChoice('2', 'الثلاثاء'),
+          WorkflowChoice('3', 'الأربعاء'),
+          WorkflowChoice('4', 'الخميس'),
+          WorkflowChoice('5', 'الجمعة'),
+          WorkflowChoice('6', 'السبت'),
+        ],
+      ),
+      WorkflowField(
+        name: 'startLocal',
+        label: 'وقت البداية (HH:mm)',
+        required: true,
+        initialValue: '08:00',
+      ),
+      WorkflowField(
+        name: 'endLocal',
+        label: 'وقت النهاية (HH:mm)',
+        required: true,
+        initialValue: '22:00',
+      ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'ساري من',
+        type: WorkflowFieldType.date,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'validUntil',
+        label: 'ساري حتى (اختياري)',
+        type: WorkflowFieldType.date,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'dayOfWeek': int.tryParse(values['dayOfWeek'] ?? '') ?? 0,
+      'startLocal': values['startLocal'],
+      'endLocal': values['endLocal'],
+      'validFrom': values['validFrom'],
+      if (values['validUntil']?.isNotEmpty == true)
+        'validUntil': values['validUntil'],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createBookingBlackout',
+    title: 'إضافة فترة حجب',
+    description: 'امنع الحجوزات خلال صيانة أو فعالية خاصة مع تسجيل السبب.',
+    submitLabel: 'حفظ فترة الحجب',
+    successMessage: 'تم حجب المورد خلال الفترة المحددة.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/bookable-resources/{resourceId}/blackout-periods',
+    icon: Icons.event_busy_outlined,
+    fields: [
+      WorkflowField(
+        name: 'resourceId',
+        label: 'مورد الحجز',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/bookable-resources',
+        labelKeys: ['name'],
+        subtitleKeys: ['type', 'facilityName'],
+      ),
+      WorkflowField(
+        name: 'startsAt',
+        label: 'بداية الحجب',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'endsAt',
+        label: 'نهاية الحجب',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'reason',
+        label: 'سبب الحجب',
+        type: WorkflowFieldType.textarea,
+        required: true,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'startsAt': _asIso(values['startsAt']),
+      'endsAt': _asIso(values['endsAt']),
+      'reason': values['reason']?.trim(),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createSessionSlot',
+    title: 'إضافة موعد حصة',
+    description:
+        'أنشئ موعدًا فعليًا للحصة أو التدريب، مع المدرب والسعة عند الحاجة.',
+    submitLabel: 'حفظ موعد الحصة',
+    successMessage: 'تم إنشاء موعد الحصة وأصبح متاحًا للحجز.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/bookable-resources/{resourceId}/session-slots',
+    icon: Icons.add_alarm_outlined,
+    fields: [
+      WorkflowField(
+        name: 'resourceId',
+        label: 'مورد الحجز',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/bookable-resources',
+        labelKeys: ['name'],
+        subtitleKeys: ['type', 'facilityName'],
+      ),
+      WorkflowField(
+        name: 'trainerProfileId',
+        label: 'المدرب (اختياري)',
+        type: WorkflowFieldType.reference,
+        referencePath: '/organizations/{organizationId}/trainers',
+        labelKeys: ['displayName', 'name'],
+        subtitleKeys: ['employeeNumber'],
+      ),
+      WorkflowField(
+        name: 'startsAt',
+        label: 'بداية الموعد',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'endsAt',
+        label: 'نهاية الموعد',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'capacity',
+        label: 'السعة (اختياري)',
+        type: WorkflowFieldType.number,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      if (values['trainerProfileId']?.isNotEmpty == true)
+        'trainerProfileId': values['trainerProfileId'],
+      'startsAt': _asIso(values['startsAt']),
+      'endsAt': _asIso(values['endsAt']),
+      if (values['capacity']?.isNotEmpty == true)
+        'capacity': int.tryParse(values['capacity']!),
     },
   ),
   MobileWorkflow(
@@ -3238,6 +3578,60 @@ final mobileWorkflows = <MobileWorkflow>[
     },
   ),
   MobileWorkflow(
+    operationId: 'redeemMealPlan',
+    title: 'استبدال وجبة من الخطة',
+    description: 'اختر العضو واشتراك خطة الوجبات والصنف؛ سيُخصم الاستحقاق دون إنشاء تحصيل جديد.',
+    submitLabel: 'تأكيد استبدال الوجبة',
+    successMessage: 'تم استبدال الوجبة وإرسال الطلب إلى المطبخ.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/restaurant-orders/meal-plan-redemptions',
+    icon: Icons.redeem_outlined,
+    fields: [
+      WorkflowField(
+        name: 'memberId',
+        label: 'العضو',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber'],
+      ),
+      WorkflowField(
+        name: 'subscriptionId',
+        label: 'اشتراك خطة الوجبات',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath:
+            '/organizations/{organizationId}/subscriptions?memberId={memberId}',
+        labelKeys: ['packageName', 'subscriptionNumber'],
+        subtitleKeys: ['status', 'visitsRemaining'],
+      ),
+      WorkflowField(
+        name: 'mealId',
+        label: 'الوجبة',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/restaurant/meals',
+        labelKeys: ['name', 'mealName'],
+        subtitleKeys: ['categoryName'],
+      ),
+      WorkflowField(
+        name: 'quantity',
+        label: 'الكمية',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '1',
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'memberId': values['memberId'],
+      'subscriptionId': values['subscriptionId'],
+      'mealId': values['mealId'],
+      'quantity': int.tryParse(values['quantity'] ?? '') ?? 1,
+    },
+  ),
+  MobileWorkflow(
     operationId: 'createRestaurantMeal',
     title: 'إضافة وجبة',
     description: 'أضف الوجبة مع تصنيفها وحجمها وقيمها الغذائية.',
@@ -3366,7 +3760,7 @@ final mobileWorkflows = <MobileWorkflow>[
   MobileWorkflow(
     operationId: 'createRestaurantMealPrice',
     title: 'تسعير وجبة',
-    description: 'حدد سعر الوجبة وضريبتها في الفرع الحالي.',
+    description: 'حدد سعر الوجبة وضريبتها وتاريخ بدء السريان في الفرع الحالي. لن تُنشر قائمة يومية إذا بدأ السعر بعد ظهر تاريخ القائمة.',
     submitLabel: 'حفظ سعر الوجبة',
     successMessage: 'تم حفظ سعر الوجبة.',
     method: 'POST',
@@ -3401,6 +3795,16 @@ final mobileWorkflows = <MobileWorkflow>[
         type: WorkflowFieldType.checkbox,
         initialValue: 'true',
       ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'بداية سريان السعر',
+        type: WorkflowFieldType.dateTime,
+        required: true,
+        initialValue: _localDateTimeValue(
+          DateTime.now().subtract(const Duration(days: 1)),
+        ),
+        autoFillDate: false,
+      ),
     ],
     body: (values, controller) => {
       'branchId': controller.branchId,
@@ -3409,7 +3813,7 @@ final mobileWorkflows = <MobileWorkflow>[
       'taxRateBps': ((double.tryParse(values['taxRate'] ?? '') ?? 0) * 100)
           .round(),
       'taxInclusive': _checked(values['taxInclusive']),
-      'validFrom': DateTime.now().toUtc().toIso8601String(),
+      'validFrom': _asIso(values['validFrom']),
     },
   ),
   MobileWorkflow(
@@ -3718,6 +4122,33 @@ final mobileWorkflows = <MobileWorkflow>[
     },
   ),
   MobileWorkflow(
+    operationId: 'createBarcodePrintBatch',
+    title: 'إصدار دفعة بطاقات أعضاء',
+    description:
+        'اختر مجموعة أعضاء لإصدار بطاقات الدخول دفعة واحدة وتجهيزها للطباعة.',
+    submitLabel: 'إصدار دفعة البطاقات',
+    successMessage: 'تم إصدار دفعة بطاقات الدخول.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/access-credentials/barcode-print-batches',
+    icon: Icons.print_outlined,
+    fields: [
+      WorkflowField(
+        name: 'memberIds',
+        label: 'الأعضاء',
+        type: WorkflowFieldType.multiReference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber'],
+      ),
+    ],
+    body: (values, controller) => {
+      'subjects': _selectedValues(values['memberIds'])
+          .map((id) => {'subjectType': 'MEMBER', 'subjectId': id})
+          .toList(),
+    },
+  ),
+  MobileWorkflow(
     operationId: 'assignFingerprintPin',
     title: 'ربط PIN البصمة',
     description: 'اربط رقم جهاز البصمة بعضو أو موظف دون نقل قالب البصمة.',
@@ -3840,6 +4271,169 @@ final mobileWorkflows = <MobileWorkflow>[
     },
   ),
   MobileWorkflow(
+    operationId: 'assignTrainerToBranch',
+    title: 'إسناد مدرب إلى فرع',
+    description:
+        'اربط ملف المدرب بالفرع الحالي وحدد فترة سريان الإسناد عند الحاجة.',
+    submitLabel: 'حفظ إسناد الفرع',
+    successMessage: 'تم إسناد المدرب إلى الفرع.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/trainers/{trainerId}/branch-assignments',
+    icon: Icons.add_business_outlined,
+    fields: [
+      WorkflowField(
+        name: 'trainerId',
+        label: 'المدرب',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/trainers',
+        labelKeys: ['displayName', 'name'],
+        subtitleKeys: ['employeeNumber', 'status'],
+      ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'بداية الإسناد (اختياري)',
+        type: WorkflowFieldType.dateTime,
+        autoFillDate: false,
+      ),
+      WorkflowField(
+        name: 'validUntil',
+        label: 'نهاية الإسناد (اختياري)',
+        type: WorkflowFieldType.dateTime,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      if (values['validFrom']?.isNotEmpty == true)
+        'validFrom': _asIso(values['validFrom']),
+      if (values['validUntil']?.isNotEmpty == true)
+        'validUntil': _asIso(values['validUntil']),
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'createTrainerAvailability',
+    title: 'إضافة أوقات عمل مدرب',
+    description:
+        'حدد اليوم وساعات توفر المدرب في الفرع لبناء جدول التدريب والحجوزات.',
+    submitLabel: 'حفظ وقت المدرب',
+    successMessage: 'تمت إضافة وقت توفر المدرب.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/trainers/{trainerId}/availability-rules',
+    icon: Icons.schedule_outlined,
+    fields: [
+      WorkflowField(
+        name: 'trainerId',
+        label: 'المدرب',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/trainers',
+        labelKeys: ['displayName', 'name'],
+        subtitleKeys: ['employeeNumber'],
+      ),
+      WorkflowField(
+        name: 'dayOfWeek',
+        label: 'اليوم',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: '0',
+        choices: [
+          WorkflowChoice('0', 'الأحد'),
+          WorkflowChoice('1', 'الاثنين'),
+          WorkflowChoice('2', 'الثلاثاء'),
+          WorkflowChoice('3', 'الأربعاء'),
+          WorkflowChoice('4', 'الخميس'),
+          WorkflowChoice('5', 'الجمعة'),
+          WorkflowChoice('6', 'السبت'),
+        ],
+      ),
+      WorkflowField(
+        name: 'startLocal',
+        label: 'وقت البداية (HH:mm)',
+        required: true,
+        initialValue: '08:00',
+      ),
+      WorkflowField(
+        name: 'endLocal',
+        label: 'وقت النهاية (HH:mm)',
+        required: true,
+        initialValue: '22:00',
+      ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'ساري من',
+        type: WorkflowFieldType.date,
+        required: true,
+      ),
+      WorkflowField(
+        name: 'validUntil',
+        label: 'ساري حتى (اختياري)',
+        type: WorkflowFieldType.date,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'branchId': controller.branchId,
+      'dayOfWeek': int.tryParse(values['dayOfWeek'] ?? '') ?? 0,
+      'startLocal': values['startLocal'],
+      'endLocal': values['endLocal'],
+      'validFrom': values['validFrom'],
+      if (values['validUntil']?.isNotEmpty == true)
+        'validUntil': values['validUntil'],
+    },
+  ),
+  MobileWorkflow(
+    operationId: 'assignMemberToTrainer',
+    title: 'إسناد عضو إلى مدرب',
+    description:
+        'اربط العضو بالمدرب في الفرع الحالي ليظهر في مساحة عمل المدرب الذاتية.',
+    submitLabel: 'حفظ إسناد العضو',
+    successMessage: 'تم إسناد العضو إلى المدرب.',
+    method: 'POST',
+    path: '/organizations/{organizationId}/trainers/{trainerId}/member-assignments',
+    icon: Icons.group_add_outlined,
+    fields: [
+      WorkflowField(
+        name: 'trainerId',
+        label: 'المدرب',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/trainers',
+        labelKeys: ['displayName', 'name'],
+        subtitleKeys: ['employeeNumber'],
+      ),
+      WorkflowField(
+        name: 'memberId',
+        label: 'العضو',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/members',
+        labelKeys: ['name', 'fullNameAr'],
+        subtitleKeys: ['memberNumber', 'phoneE164'],
+      ),
+      WorkflowField(
+        name: 'validFrom',
+        label: 'بداية الإسناد (اختياري)',
+        type: WorkflowFieldType.dateTime,
+        autoFillDate: false,
+      ),
+      WorkflowField(
+        name: 'validUntil',
+        label: 'نهاية الإسناد (اختياري)',
+        type: WorkflowFieldType.dateTime,
+        autoFillDate: false,
+      ),
+    ],
+    body: (values, controller) => {
+      'memberId': values['memberId'],
+      'branchId': controller.branchId,
+      if (values['validFrom']?.isNotEmpty == true)
+        'validFrom': _asIso(values['validFrom']),
+      if (values['validUntil']?.isNotEmpty == true)
+        'validUntil': _asIso(values['validUntil']),
+    },
+  ),
+  MobileWorkflow(
     operationId: 'createOtherIncomeCategory',
     title: 'إضافة تصنيف إيراد',
     description: 'أضف بندًا لتصنيف الإيرادات غير المرتبطة بالمبيعات.',
@@ -3902,7 +4496,8 @@ final mobileWorkflows = <MobileWorkflow>[
   MobileWorkflow(
     operationId: 'createCommunicationCampaign',
     title: 'إرسال رسالة للأعضاء',
-    description: 'أرسل إشعارًا داخل النظام لعضو محدد أو لكل الأعضاء النشطين.',
+    description:
+        'كوّن رسالة احترافية، عاين عدد المستلمين، ثم أرسلها فورًا أو جدولها.',
     submitLabel: 'إرسال الرسالة',
     successMessage: 'تم إنشاء حملة التواصل.',
     method: 'POST',
@@ -3926,6 +4521,15 @@ final mobileWorkflows = <MobileWorkflow>[
         ],
       ),
       WorkflowField(
+        name: 'templateId',
+        label: 'رسالة محفوظة (اختياري)',
+        type: WorkflowFieldType.reference,
+        referencePath: '/organizations/{organizationId}/communication-templates?includeInactive=false',
+        labelKeys: ['name'],
+        subtitleKeys: ['title', 'purpose'],
+        copyValues: {'title': 'title', 'body': 'body', 'purpose': 'purpose'},
+      ),
+      WorkflowField(
         name: 'audienceType',
         label: 'الجمهور',
         type: WorkflowFieldType.select,
@@ -3934,6 +4538,10 @@ final mobileWorkflows = <MobileWorkflow>[
         choices: [
           WorkflowChoice('ALL_MEMBERS', 'كل الأعضاء النشطين'),
           WorkflowChoice('SINGLE_MEMBER', 'عضو محدد'),
+          WorkflowChoice('MEMBER_SEGMENT', 'اشتراكات تنتهي قريبًا'),
+          WorkflowChoice('ALL_LEADS', 'كل العملاء المحتملين'),
+          WorkflowChoice('SINGLE_LEAD', 'عميل محتمل محدد'),
+          WorkflowChoice('LEAD_SEGMENT', 'شريحة عملاء محتملين'),
         ],
       ),
       WorkflowField(
@@ -3946,6 +4554,33 @@ final mobileWorkflows = <MobileWorkflow>[
         subtitleKeys: ['memberNumber'],
         visibleWhenField: 'audienceType',
         visibleWhenValues: ['SINGLE_MEMBER'],
+      ),
+      WorkflowField(
+        name: 'leadId',
+        label: 'العميل المحتمل',
+        type: WorkflowFieldType.reference,
+        required: true,
+        referencePath: '/organizations/{organizationId}/crm/leads',
+        labelKeys: ['fullName', 'name'],
+        subtitleKeys: ['phoneE164', 'status'],
+        visibleWhenField: 'audienceType',
+        visibleWhenValues: ['SINGLE_LEAD'],
+      ),
+      WorkflowField(
+        name: 'expiryDays',
+        label: 'تنتهي العضوية خلال عدد أيام',
+        type: WorkflowFieldType.number,
+        required: true,
+        initialValue: '7',
+        visibleWhenField: 'audienceType',
+        visibleWhenValues: ['MEMBER_SEGMENT'],
+      ),
+      WorkflowField(
+        name: 'leadStatuses',
+        label: 'مراحل العملاء (افصل بينها بفاصلة)',
+        initialValue: 'NEW,CONTACTED,QUALIFIED,TRIAL_SCHEDULED',
+        visibleWhenField: 'audienceType',
+        visibleWhenValues: ['ALL_LEADS', 'LEAD_SEGMENT'],
       ),
       WorkflowField(name: 'title', label: 'عنوان الإشعار', required: true),
       WorkflowField(
@@ -3967,10 +4602,26 @@ final mobileWorkflows = <MobileWorkflow>[
       'purpose': values['purpose'],
       'title': values['title']?.trim(),
       'body': values['body']?.trim(),
+      if (values['templateId']?.isNotEmpty == true)
+        'templateId': values['templateId'],
       'audienceType': values['audienceType'],
-      'audienceFilter': values['audienceType'] == 'SINGLE_MEMBER'
-          ? {'memberId': values['memberId']}
-          : {'memberStatus': 'ACTIVE'},
+      'audienceFilter': switch (values['audienceType']) {
+        'SINGLE_MEMBER' => {'memberId': values['memberId']},
+        'SINGLE_LEAD' => {'leadId': values['leadId']},
+        'MEMBER_SEGMENT' => {
+          'memberStatus': 'ACTIVE',
+          'subscriptionEndingWithinDays':
+              int.tryParse(values['expiryDays'] ?? '') ?? 7,
+        },
+        'ALL_LEADS' || 'LEAD_SEGMENT' => {
+          'leadStatuses': (values['leadStatuses'] ?? '')
+              .split(',')
+              .map((item) => item.trim())
+              .where((item) => item.isNotEmpty)
+              .toList(),
+        },
+        _ => {'memberStatus': 'ACTIVE'},
+      },
       'channels': ['IN_APP'],
       if (values['scheduledAt']?.isNotEmpty == true)
         'scheduledAt': _asIso(values['scheduledAt']),
@@ -5408,6 +6059,7 @@ class GoController extends ChangeNotifier {
   List<Map<String, dynamic>> branches = [];
   List<String> organizationIds = [];
   Map<String, dynamic> account = {};
+  String currentUserAccountId = '';
   String organizationId = 'demo-organization';
   String branchId = 'main-branch';
   String branchName = 'فرع العليا';
@@ -5519,6 +6171,7 @@ class GoController extends ChangeNotifier {
       return;
     }
     final me = await api.currentUser();
+    currentUserAccountId = me['userAccountId']?.toString() ?? '';
     grants =
         (me['grants'] as List?)
             ?.whereType<Map>()
@@ -10981,13 +11634,15 @@ class _ResourcePageState extends State<ResourcePage> {
 
   @override
   Widget build(BuildContext context) {
-    final candidateWorkflow = _workflowForFeature(widget.feature);
-    final workflow =
-        candidateWorkflow != null &&
-            _canRunWorkflow(widget.controller, candidateWorkflow) &&
-            (!widget.feature.path.contains('/daily-menus/') || rows.isEmpty)
-        ? candidateWorkflow
-        : null;
+    final workflows = _workflowsForFeature(widget.feature)
+        .where((workflow) => _canRunWorkflow(widget.controller, workflow))
+        .where(
+          (workflow) =>
+              !widget.feature.path.contains('/daily-menus/') ||
+              rows.isEmpty ||
+              workflow.operationId != 'createDailyMenu',
+        )
+        .toList();
     final visible = rows
         .where(
           (row) =>
@@ -11008,14 +11663,18 @@ class _ResourcePageState extends State<ResourcePage> {
           style: const TextStyle(fontWeight: FontWeight.w900),
         ),
         actions: [
-          if (workflow != null)
+          if (workflows.isNotEmpty)
             IconButton(
               onPressed: () async {
-                await _openWorkflow(context, widget.controller, workflow);
+                await _openWorkflow(
+                  context,
+                  widget.controller,
+                  workflows.first,
+                );
                 if (mounted) await load();
               },
               icon: const Icon(Icons.add_circle_outline_rounded),
-              tooltip: workflow.submitLabel,
+              tooltip: workflows.first.submitLabel,
             ),
         ],
       ),
@@ -11031,14 +11690,28 @@ class _ResourcePageState extends State<ResourcePage> {
               ),
             ),
             const SizedBox(height: 16),
-            if (workflow != null) ...[
-              FilledButton.icon(
-                onPressed: () async {
-                  await _openWorkflow(context, widget.controller, workflow);
-                  if (mounted) await load();
-                },
-                icon: Icon(workflow.icon),
-                label: Text(workflow.submitLabel),
+            if (workflows.isNotEmpty) ...[
+              const SectionHeader(title: 'الإجراءات المتاحة'),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: workflows
+                    .map(
+                      (workflow) => FilledButton.tonalIcon(
+                        onPressed: () async {
+                          await _openWorkflow(
+                            context,
+                            widget.controller,
+                            workflow,
+                          );
+                          if (mounted) await load();
+                        },
+                        icon: Icon(workflow.icon, size: 18),
+                        label: Text(workflow.submitLabel),
+                      ),
+                    )
+                    .toList(),
               ),
               const SizedBox(height: 12),
             ],
@@ -11104,6 +11777,7 @@ class _ResourceCard extends StatelessWidget {
       row,
     );
     final recordActions = _recordActions(controller, feature, row);
+    final relatedViews = _relatedViewsForFeature(controller, feature, row);
     final values = feature.fields
         .map((field) => (field.$2, _displayValue(field.$1, row[field.$1])))
         .where((entry) => entry.$2.isNotEmpty)
@@ -11164,7 +11838,8 @@ class _ResourceCard extends StatelessWidget {
                 ),
                 if (editWorkflow != null ||
                     contextualWorkflow != null ||
-                    recordActions.isNotEmpty) ...[
+                    recordActions.isNotEmpty ||
+                    relatedViews.isNotEmpty) ...[
                   const Divider(height: 22),
                   Align(
                     alignment: AlignmentDirectional.centerEnd,
@@ -11213,6 +11888,20 @@ class _ResourceCard extends StatelessWidget {
                             icon: const Icon(Icons.tune_rounded, size: 18),
                             label: const Text('إجراءات السجل'),
                           ),
+                        if (relatedViews.isNotEmpty)
+                          OutlinedButton.icon(
+                            onPressed: () => Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder: (_) => _RelatedResourcePage(
+                                  controller: controller,
+                                  title: heading,
+                                  views: relatedViews,
+                                ),
+                              ),
+                            ),
+                            icon: const Icon(Icons.visibility_outlined),
+                            label: const Text('التفاصيل المرتبطة'),
+                          ),
                       ],
                     ),
                   ),
@@ -11225,6 +11914,315 @@ class _ResourceCard extends StatelessWidget {
     );
   }
 }
+
+class _RelatedView {
+  const _RelatedView(this.title, this.path, this.icon);
+  final String title;
+  final String path;
+  final IconData icon;
+}
+
+List<_RelatedView> _relatedViewsForFeature(
+  GoController controller,
+  ResourceFeature feature,
+  Map<String, dynamic> row,
+) {
+  final organization = controller.organizationId;
+  final branch = row['branchId']?.toString().isNotEmpty == true
+      ? row['branchId'].toString()
+      : controller.branchId;
+  final id = _rowId(row, [
+    'id',
+    'shiftId',
+    'invoiceId',
+    'reservationId',
+    'sessionId',
+  ]);
+  if (id.isEmpty) return const [];
+  if (feature.path.endsWith('/cashier-shifts')) {
+    return [
+      _RelatedView(
+        'كشف حركة الوردية',
+        '/organizations/$organization/cashier-shifts/$id/ledger?branchId=${Uri.encodeQueryComponent(branch)}',
+        Icons.receipt_long_outlined,
+      ),
+    ];
+  }
+  if (feature.path.endsWith('/bookable-resources')) {
+    final from = DateTime.now().toUtc().toIso8601String();
+    final to = DateTime.now()
+        .add(const Duration(days: 30))
+        .toUtc()
+        .toIso8601String();
+    return [
+      _RelatedView(
+        'قواعد الإتاحة الأسبوعية',
+        '/organizations/$organization/bookable-resources/$id/availability-rules',
+        Icons.calendar_view_week_outlined,
+      ),
+      _RelatedView(
+        'المواعيد المتاحة خلال 30 يومًا',
+        '/organizations/$organization/bookable-resources/$id/session-slots?from=${Uri.encodeQueryComponent(from)}&to=${Uri.encodeQueryComponent(to)}',
+        Icons.event_available_outlined,
+      ),
+    ];
+  }
+  if (feature.path.endsWith('/trainers')) {
+    return [
+      _RelatedView(
+        'جدول توفر المدرب',
+        '/organizations/$organization/trainers/$id/availability-rules?branchId=${Uri.encodeQueryComponent(branch)}',
+        Icons.schedule_outlined,
+      ),
+      _RelatedView(
+        'الأعضاء المسندون للمدرب',
+        '/organizations/$organization/trainers/$id/member-assignments?branchId=${Uri.encodeQueryComponent(branch)}&limit=100',
+        Icons.groups_2_outlined,
+      ),
+    ];
+  }
+  if (feature.path.endsWith('/crm/leads')) {
+    return [
+      _RelatedView(
+        'ملف العميل وسجل المراحل والمتابعات',
+        '/organizations/$organization/crm/leads/$id',
+        Icons.history_edu_outlined,
+      ),
+    ];
+  }
+  final detailPath = switch (feature.path) {
+    '/organizations/{organizationId}/invoices' =>
+      '/organizations/$organization/invoices/$id',
+    '/organizations/{organizationId}/reservations' =>
+      '/organizations/$organization/reservations/$id',
+    '/organizations/{organizationId}/measurement-sessions' =>
+      '/organizations/$organization/measurement-sessions/$id',
+    _ => null,
+  };
+  return detailPath == null
+      ? const []
+      : [
+          _RelatedView(
+            'تفاصيل السجل الكاملة',
+            detailPath,
+            Icons.article_outlined,
+          ),
+        ];
+}
+
+class _RelatedResourcePage extends StatefulWidget {
+  const _RelatedResourcePage({
+    required this.controller,
+    required this.title,
+    required this.views,
+  });
+  final GoController controller;
+  final String title;
+  final List<_RelatedView> views;
+
+  @override
+  State<_RelatedResourcePage> createState() => _RelatedResourcePageState();
+}
+
+class _RelatedResourcePageState extends State<_RelatedResourcePage> {
+  int selected = 0;
+  bool loading = true;
+  String? error;
+  dynamic data;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(load());
+  }
+
+  Future<void> load() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      data = await widget.controller.api.request(widget.views[selected].path);
+    } catch (exception) {
+      error = _errorMessage(exception);
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  List<Map<String, dynamic>> get rows {
+    final value = data;
+    if (value is List) {
+      return value.whereType<Map>().map(Map<String, dynamic>.from).toList();
+    }
+    if (value is Map && value['items'] is List) {
+      return (value['items'] as List)
+          .whereType<Map>()
+          .map(Map<String, dynamic>.from)
+          .toList();
+    }
+    return value is Map ? [Map<String, dynamic>.from(value)] : const [];
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: Text(
+        widget.title,
+        style: const TextStyle(fontWeight: FontWeight.w900),
+      ),
+      actions: [
+        IconButton(
+          onPressed: loading ? null : load,
+          icon: const Icon(Icons.refresh),
+        ),
+      ],
+    ),
+    body: RefreshIndicator(
+      onRefresh: load,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.all(18),
+        children: [
+          if (widget.views.length > 1)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: widget.views.indexed
+                    .map(
+                      (entry) => ChoiceChip(
+                        avatar: Icon(entry.$2.icon, size: 18),
+                        label: Text(entry.$2.title),
+                        selected: selected == entry.$1,
+                        onSelected: (_) {
+                          setState(() => selected = entry.$1);
+                          unawaited(load());
+                        },
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
+          if (loading)
+            const Padding(
+              padding: EdgeInsets.only(top: 90),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (error != null)
+            _ResourceMessage(
+              icon: Icons.cloud_off_outlined,
+              title: 'تعذر تحميل التفاصيل',
+              body: error!,
+              action: load,
+            )
+          else if (rows.isEmpty)
+            const _ResourceMessage(
+              icon: Icons.inbox_outlined,
+              title: 'لا توجد بيانات مرتبطة',
+              body: 'ستظهر السجلات هنا فور إضافتها أو تسجيل حركة عليها.',
+            )
+          else
+            ...rows.indexed.map(
+              (entry) => _RelatedDataCard(index: entry.$1, row: entry.$2),
+            ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _RelatedDataCard extends StatelessWidget {
+  const _RelatedDataCard({required this.index, required this.row});
+  final int index;
+  final Map<String, dynamic> row;
+
+  @override
+  Widget build(BuildContext context) {
+    final visible = row.entries
+        .where(
+          (entry) => entry.value != null && entry.value.toString().isNotEmpty,
+        )
+        .toList();
+    final title =
+        ['name', 'displayName', 'memberName', 'invoiceNumber', 'type', 'status']
+            .map((key) => row[key]?.toString() ?? '')
+            .firstWhere(
+              (value) => value.isNotEmpty,
+              orElse: () => 'سجل ${index + 1}',
+            );
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: ExpansionTile(
+        initiallyExpanded: index == 0,
+        title: Text(title, style: const TextStyle(fontWeight: FontWeight.w900)),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+        children: visible
+            .map(
+              (entry) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 5),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 116,
+                      child: Text(
+                        _relatedFieldLabel(entry.key),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: SelectableText(
+                        entry.value is Map || entry.value is List
+                            ? const JsonEncoder.withIndent('  ')
+                                  .convert(entry.value)
+                            : _displayValue(entry.key, entry.value),
+                        textDirection: entry.value is Map || entry.value is List
+                            ? TextDirection.ltr
+                            : null,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            )
+            .toList(),
+      ),
+    );
+  }
+}
+
+String _relatedFieldLabel(String key) =>
+    const {
+      'status': 'الحالة',
+      'type': 'النوع',
+      'name': 'الاسم',
+      'displayName': 'الاسم',
+      'memberName': 'العضو',
+      'branchName': 'الفرع',
+      'startsAt': 'يبدأ في',
+      'endsAt': 'ينتهي في',
+      'startLocal': 'وقت البداية',
+      'endLocal': 'وقت النهاية',
+      'dayOfWeek': 'يوم الأسبوع',
+      'amountMinor': 'المبلغ',
+      'balanceMinor': 'الرصيد',
+      'invoiceNumber': 'رقم الفاتورة',
+      'entries': 'الحركات',
+      'items': 'البنود',
+      'payments': 'الدفعات',
+      'createdAt': 'تاريخ الإنشاء',
+      'updatedAt': 'آخر تحديث',
+    }[key] ??
+    _humanizeOperation(key);
 
 MobileWorkflow? _contextWorkflowForFeature(
   GoController controller,
@@ -11326,6 +12324,36 @@ MobileWorkflow? _contextWorkflowForFeature(
         },
       );
     }
+  }
+  if (feature.path.endsWith('/employees') &&
+      controller.can('workforce.accounts.manage')) {
+    return MobileWorkflow(
+      operationId: 'resetEmployeePassword:$id',
+      title: row['hasLoginAccount'] == true
+          ? 'تغيير كلمة مرور الموظف'
+          : 'إنشاء حساب دخول الموظف',
+      description: 'يُنشئ النظام حساب الدخول عند عدم وجوده، أو يغيّر كلمة المرور للحساب المرتبط بأمان.',
+      submitLabel: 'حفظ كلمة المرور الجديدة',
+      successMessage: 'تم تحديث بيانات دخول الموظف.',
+      method: 'POST',
+      path: '/organizations/{organizationId}/employees/$id/password-resets',
+      icon: Icons.password_rounded,
+      fields: const [
+        WorkflowField(
+          name: 'password',
+          label: 'كلمة المرور الجديدة',
+          type: WorkflowFieldType.password,
+          required: true,
+        ),
+        WorkflowField(
+          name: 'confirmPassword',
+          label: 'تأكيد كلمة المرور',
+          type: WorkflowFieldType.password,
+          required: true,
+        ),
+      ],
+      body: (values, controller) => {'password': values['password']},
+    );
   }
   if (feature.path.endsWith('/cashier-shifts') &&
       status == 'OPEN' &&
@@ -11692,6 +12720,7 @@ class _RecordAction {
     this.requiresReason = false,
     this.requiresDays = false,
     this.destructive = false,
+    this.method = 'POST',
   });
   final String label;
   final IconData icon;
@@ -11700,6 +12729,7 @@ class _RecordAction {
   final bool requiresReason;
   final bool requiresDays;
   final bool destructive;
+  final String method;
   final _RecordActionBody body;
 }
 
@@ -11748,6 +12778,29 @@ List<_RecordAction> _recordActions(
 
   if (!path.startsWith('/self/') && path.endsWith('/subscriptions')) {
     final id = _rowId(row, ['id', 'subscriptionId']);
+    final schedules = row['freezeSchedules'] is List
+        ? (row['freezeSchedules'] as List).whereType<Map>()
+        : const Iterable<Map>.empty();
+    final pendingSchedule = schedules
+        .where((item) => item['status']?.toString() == 'PENDING')
+        .firstOrNull;
+    if (id.isNotEmpty && pendingSchedule != null) {
+      final scheduleId = pendingSchedule['id']?.toString() ?? '';
+      if (scheduleId.isNotEmpty) {
+        add(
+          _RecordAction(
+            label: 'إلغاء التجميد المجدول',
+            icon: Icons.event_busy_outlined,
+            path:
+                '/organizations/$organization/subscriptions/$id/freeze-schedules/$scheduleId/cancellations',
+            permission: 'subscriptions.freeze',
+            requiresReason: true,
+            destructive: true,
+            body: (reason, _) => {'expectedVersion': version, 'reason': reason},
+          ),
+        );
+      }
+    }
     if (id.isNotEmpty && status == 'ACTIVE') {
       add(
         _RecordAction(
@@ -11777,6 +12830,40 @@ List<_RecordAction> _recordActions(
       );
     }
     if (id.isNotEmpty && !const {'CANCELLED', 'EXPIRED'}.contains(status)) {
+      add(
+        _RecordAction(
+          label: 'إضافة أيام للاشتراك',
+          icon: Icons.more_time_rounded,
+          path: '/organizations/$organization/subscriptions/$id/adjustments',
+          permission: 'subscriptions.adjustments.manage',
+          requiresReason: true,
+          requiresDays: true,
+          body: (reason, value) => {
+            'expectedVersion': version,
+            'type': 'EXTEND_DAYS',
+            'value': value,
+            'reason': reason,
+          },
+        ),
+      );
+      if (row['visitAllowance'] != null) {
+        add(
+          _RecordAction(
+            label: 'إضافة زيارات للاشتراك',
+            icon: Icons.add_task_rounded,
+            path: '/organizations/$organization/subscriptions/$id/adjustments',
+            permission: 'subscriptions.adjustments.manage',
+            requiresReason: true,
+            requiresDays: true,
+            body: (reason, value) => {
+              'expectedVersion': version,
+              'type': 'ADD_VISITS',
+              'value': value,
+              'reason': reason,
+            },
+          ),
+        );
+      }
       add(
         _RecordAction(
           label: 'إلغاء الاشتراك',
@@ -11964,6 +13051,12 @@ List<_RecordAction> _recordActions(
       _ => const <(String, String)>[],
     };
     for (final transition in transitions) {
+      final createdBy = row['createdBy']?.toString() ?? '';
+      if (transition.$1 == 'APPROVE' &&
+          createdBy.isNotEmpty &&
+          createdBy == controller.currentUserAccountId) {
+        continue;
+      }
       add(
         _RecordAction(
           label: transition.$2,
@@ -12061,6 +13154,23 @@ List<_RecordAction> _recordActions(
     }
   }
 
+  if (path.endsWith('/commercial-policies') && status == 'ACTIVE') {
+    final id = _rowId(row, ['id', 'policyId']);
+    if (id.isNotEmpty) {
+      add(
+        _RecordAction(
+          label: 'أرشفة إصدار السياسة',
+          icon: Icons.archive_outlined,
+          path: '/organizations/$organization/commercial-policies/$id',
+          permission: 'policies.manage',
+          destructive: true,
+          method: 'PATCH',
+          body: (_, _) => {'status': 'INACTIVE'},
+        ),
+      );
+    }
+  }
+
   if (path.endsWith('/communication-campaigns')) {
     final id = _rowId(row, ['id', 'campaignId']);
     if (id.isNotEmpty && status == 'SCHEDULED') {
@@ -12093,6 +13203,23 @@ List<_RecordAction> _recordActions(
           requiresReason: true,
           destructive: true,
           body: (reason, _) => {'expectedVersion': version, 'reason': reason},
+        ),
+      );
+    }
+  }
+
+  if (path.endsWith('/roles') && status == 'ACTIVE') {
+    final id = _rowId(row, ['id', 'roleId']);
+    if (id.isNotEmpty) {
+      add(
+        _RecordAction(
+          label: 'أرشفة مجموعة الصلاحيات',
+          icon: Icons.archive_outlined,
+          path: '/organizations/$organization/roles/$id/status',
+          permission: 'iam.roles.manage',
+          destructive: true,
+          method: 'PATCH',
+          body: (_, _) => {'status': 'INACTIVE', 'expectedVersion': version},
         ),
       );
     }
@@ -12435,8 +13562,8 @@ class _RecordActionsPageState extends State<RecordActionsPage> {
         if (mounted) setState(() => saving = false);
       }
     }
-    if (action.path.startsWith('/self/') &&
-        action.path.contains('/subscriptions/') &&
+    if (action.path.contains('/subscriptions/') &&
+        !action.path.contains('/freeze-schedules/') &&
         action.path.endsWith('/cancellations')) {
       setState(() {
         saving = true;
@@ -12501,7 +13628,7 @@ class _RecordActionsPageState extends State<RecordActionsPage> {
     try {
       await widget.controller.api.request(
         action.path,
-        method: 'POST',
+        method: action.method,
         body: action.body(reason.text.trim(), requestedDays),
       );
       await widget.onChanged();
@@ -12552,7 +13679,7 @@ class _RecordActionsPageState extends State<RecordActionsPage> {
                 controller: days,
                 keyboardType: TextInputType.number,
                 decoration: const InputDecoration(
-                  labelText: 'عدد أيام التجميد',
+                  labelText: 'العدد المطلوب (أيام أو زيارات)',
                   prefixIcon: Icon(Icons.date_range_outlined),
                 ),
               ),
@@ -12909,6 +14036,213 @@ class _MobileNavSection extends StatelessWidget {
   }
 }
 
+class CrmMobileWorkspacePage extends StatefulWidget {
+  const CrmMobileWorkspacePage({super.key, required this.controller});
+  final GoController controller;
+
+  @override
+  State<CrmMobileWorkspacePage> createState() => _CrmMobileWorkspacePageState();
+}
+
+class _CrmMobileWorkspacePageState extends State<CrmMobileWorkspacePage> {
+  Map<String, dynamic> summary = {};
+  bool loading = true;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(load());
+  }
+
+  Future<void> load() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      if (widget.controller.api.configured) {
+        final now = DateTime.now();
+        final data = await widget.controller.api.request(
+          '/organizations/${widget.controller.organizationId}/crm/follow-ups/cloud',
+          query: {
+            'branchId': widget.controller.branchId,
+            'from': now
+                .subtract(const Duration(days: 30))
+                .toUtc()
+                .toIso8601String(),
+            'to': now.add(const Duration(days: 1)).toUtc().toIso8601String(),
+          },
+        );
+        summary = data is Map && data['summary'] is Map
+            ? Map<String, dynamic>.from(data['summary'] as Map)
+            : <String, dynamic>{};
+      } else {
+        summary = const {
+          'openLeads': 0,
+          'scheduledFollowUps': 0,
+          'overdueFollowUps': 0,
+          'convertedLeads': 0,
+        };
+      }
+    } catch (exception) {
+      error = _errorMessage(exception);
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  void openResource(String ending) =>
+      _openResource(context, widget.controller, _featureEnding(ending));
+
+  @override
+  Widget build(BuildContext context) {
+    final sections = [
+      if (widget.controller.can('crm.leads.read'))
+        (
+          'العملاء المحتملون',
+          'الملف، المرحلة وسجل المتابعات',
+          Icons.person_search_outlined,
+          '/crm/leads',
+        ),
+      if (widget.controller.can('crm.follow-ups.read'))
+        (
+          'جدول المتابعات',
+          'المجدولة والمتأخرة ونتائج التواصل',
+          Icons.event_note_outlined,
+          '/crm/follow-ups',
+        ),
+      if (widget.controller.can('crm.leads.read'))
+        (
+          'مصادر العملاء',
+          'قنوات اكتساب العملاء المحتملين',
+          Icons.hub_outlined,
+          '/crm/lead-sources',
+        ),
+      if (widget.controller.can('online-requests.read'))
+        (
+          'طلبات الانضمام',
+          'الطلبات الواردة وتحويلها إلى إجراء',
+          Icons.mark_email_unread_outlined,
+          '/online-requests',
+        ),
+    ];
+    final metrics = [
+      (
+        'فرص مفتوحة',
+        summary['openLeads'],
+        Icons.person_search_outlined,
+        Colors.blue,
+      ),
+      (
+        'متابعات مجدولة',
+        summary['scheduledFollowUps'],
+        Icons.calendar_month_outlined,
+        Colors.deepPurple,
+      ),
+      (
+        'متابعات متأخرة',
+        summary['overdueFollowUps'],
+        Icons.schedule_outlined,
+        Colors.red,
+      ),
+      (
+        'تحولوا إلى أعضاء',
+        summary['convertedLeads'],
+        Icons.how_to_reg_outlined,
+        Colors.green,
+      ),
+    ];
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'العملاء والمتابعات',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+        actions: [
+          if (widget.controller.can('crm.leads.manage'))
+            IconButton(
+              tooltip: 'إضافة عميل محتمل',
+              icon: const Icon(Icons.person_add_alt_1_outlined),
+              onPressed: () async {
+                final workflow = mobileWorkflows.firstWhere(
+                  (item) => item.operationId == 'createCrmLead',
+                );
+                await _openWorkflow(context, widget.controller, workflow);
+                if (mounted) await load();
+              },
+            ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: load,
+        child: ListView(
+          padding: const EdgeInsets.all(18),
+          children: [
+            const Text(
+              'مساحة موحدة لمسار العميل من أول تواصل حتى التحويل إلى عضو.',
+              style: TextStyle(height: 1.6),
+            ),
+            const SizedBox(height: 16),
+            if (loading)
+              const LinearProgressIndicator()
+            else if (error != null)
+              _ResourceMessage(
+                icon: Icons.cloud_off_outlined,
+                title: 'تعذر تحميل ملخص CRM',
+                body: error!,
+                action: load,
+              )
+            else
+              GridView.builder(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: metrics.length,
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 2,
+                  mainAxisSpacing: 8,
+                  crossAxisSpacing: 8,
+                  childAspectRatio: .95,
+                ),
+                itemBuilder: (_, index) => MetricCard(
+                  label: metrics[index].$1,
+                  value: '${metrics[index].$2 ?? 0}',
+                  icon: metrics[index].$3,
+                  color: metrics[index].$4,
+                ),
+              ),
+            const SizedBox(height: 20),
+            const SectionHeader(title: 'مسار العمل'),
+            const SizedBox(height: 10),
+            Card(
+              child: Column(
+                children: sections.indexed.map((entry) {
+                  final item = entry.$2;
+                  return Column(
+                    children: [
+                      ListTile(
+                        leading: Icon(item.$3),
+                        title: Text(
+                          item.$1,
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                        subtitle: Text(item.$2),
+                        trailing: const Icon(Icons.chevron_left_rounded),
+                        onTap: () => openResource(item.$4),
+                      ),
+                      if (entry.$1 < sections.length - 1)
+                        const Divider(height: 1),
+                    ],
+                  );
+                }).toList(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class MorePage extends StatelessWidget {
   const MorePage({super.key, required this.controller});
   final GoController controller;
@@ -13080,13 +14414,8 @@ class MorePage extends StatelessWidget {
           title: 'العملاء والمتابعات',
           subtitle: 'العملاء المحتملون والطلبات والمتابعات القادمة',
           icon: Icons.bolt_outlined,
-          onTap: () => _hub(
-            context,
-            title: 'العملاء والمتابعات',
-            subtitle: 'كل رحلة العميل المحتمل والمتابعة في مساحة واحدة.',
-            icon: Icons.bolt_outlined,
-            endings: crm,
-          ),
+          onTap: () =>
+              _push(context, CrmMobileWorkspacePage(controller: controller)),
         ),
       if (_canAny(communications))
         _MobileNavItem(
@@ -16777,11 +18106,15 @@ class _WorkflowPageState extends State<WorkflowPage> {
             .toIso8601String();
     }
     final data = await widget.controller.api.request(path, query: query);
-    final rows = data is List
+    var rows = data is List
         ? data.whereType<Map>().toList()
         : data is Map && data['items'] is List
         ? (data['items'] as List).whereType<Map>().toList()
         : <Map>[];
+    if (widget.workflow.operationId == 'createSessionSlot' &&
+        field.name == 'resourceId') {
+      rows = rows.where((row) => row['type']?.toString() != 'COURT').toList();
+    }
     references[field.name] = rows
         .map((row) => Map<String, dynamic>.from(row))
         .toList();
@@ -16803,6 +18136,11 @@ class _WorkflowPageState extends State<WorkflowPage> {
       );
       return;
     }
+    if (widget.workflow.operationId == 'createBookableResource' &&
+        values['type'] != 'CLASS' &&
+        values['capacity'] != '1') {
+      controllers['capacity']?.text = '1';
+    }
     if (widget.workflow.operationId.startsWith('freezeSelfSubscription:')) {
       if ((values['reason'] ?? '').length < 3) {
         setState(() => error = 'اكتب سببًا واضحًا من 3 أحرف على الأقل.');
@@ -16821,7 +18159,8 @@ class _WorkflowPageState extends State<WorkflowPage> {
       setState(() => error = 'اكتب سببًا واضحًا من 3 أحرف على الأقل.');
       return;
     }
-    if (widget.workflow.operationId == 'createEmployee') {
+    if (widget.workflow.operationId == 'createEmployee' ||
+        widget.workflow.operationId.startsWith('resetEmployeePassword:')) {
       if ((values['password'] ?? '').length < 7) {
         setState(() => error = 'كلمة المرور يجب ألا تقل عن 7 محارف.');
         return;
@@ -16847,11 +18186,147 @@ class _WorkflowPageState extends State<WorkflowPage> {
       setState(() => error = 'اكتب ملاحظة إغلاق واضحة من 3 أحرف على الأقل.');
       return;
     }
+    if (const {
+      'createBookingAvailability',
+      'createTrainerAvailability',
+    }.contains(widget.workflow.operationId)) {
+      final timePattern = RegExp(r'^([01]\d|2[0-3]):[0-5]\d$');
+      final start = values['startLocal'] ?? '';
+      final end = values['endLocal'] ?? '';
+      if (!timePattern.hasMatch(start) || !timePattern.hasMatch(end)) {
+        setState(() => error = 'اكتب الوقت بصيغة 24 ساعة مثل 09:30.');
+        return;
+      }
+      if (start.compareTo(end) >= 0) {
+        setState(() => error = 'وقت النهاية يجب أن يكون بعد وقت البداية.');
+        return;
+      }
+    }
+    if (const {
+      'createBookingBlackout',
+      'createSessionSlot',
+    }.contains(widget.workflow.operationId)) {
+      final start = DateTime.tryParse(values['startsAt'] ?? '');
+      final end = DateTime.tryParse(values['endsAt'] ?? '');
+      if (start == null || end == null || !end.isAfter(start)) {
+        setState(() => error = 'تاريخ ووقت النهاية يجب أن يكونا بعد البداية.');
+        return;
+      }
+    }
+    if (const {
+          'scheduleServiceAvailability',
+          'createBookingAvailability',
+          'createTrainerAvailability',
+          'assignEmployee',
+          'assignTrainerToBranch',
+          'assignMemberToTrainer',
+        }.contains(widget.workflow.operationId) &&
+        (values['validUntil'] ?? '').isNotEmpty) {
+      final from = DateTime.tryParse(values['validFrom'] ?? '');
+      final until = DateTime.tryParse(values['validUntil'] ?? '');
+      if (from != null && until != null && until.isBefore(from)) {
+        setState(() => error = 'تاريخ النهاية لا يمكن أن يسبق تاريخ البداية.');
+        return;
+      }
+    }
+    if (widget.workflow.operationId == 'rescheduleSubscriptionStart' &&
+        (values['reason'] ?? '').length < 3) {
+      setState(() => error = 'اكتب سببًا واضحًا من 3 أحرف على الأقل.');
+      return;
+    }
+    if (widget.workflow.operationId == 'createWhatsAppCampaign') {
+      setState(() {
+        saving = true;
+        error = null;
+      });
+      try {
+        final data = await widget.controller.api.request(
+          '/communications/capabilities',
+        );
+        final whatsapp = data is Map && data['whatsapp'] is Map
+            ? data['whatsapp'] as Map
+            : const <String, dynamic>{};
+        if (whatsapp['enabled'] != true) {
+          setState(
+            () => error =
+                whatsapp['message']?.toString() ??
+                'قناة واتساب غير مهيأة على الخادم حاليًا.',
+          );
+          return;
+        }
+      } catch (exception) {
+        setState(() => error = _errorMessage(exception));
+        return;
+      } finally {
+        if (mounted) setState(() => saving = false);
+      }
+    }
+    Map<String, dynamic>? audiencePreview;
+    if (widget.workflow.operationId == 'createCommunicationCampaign') {
+      setState(() {
+        saving = true;
+        error = null;
+      });
+      try {
+        final campaign = widget.workflow.body(values, widget.controller);
+        final data = await widget.controller.api.request(
+          '/organizations/${widget.controller.organizationId}/communication-campaigns/audience-preview',
+          method: 'POST',
+          body: {
+            if (campaign['branchId'] != null) 'branchId': campaign['branchId'],
+            'audienceType': campaign['audienceType'],
+            'audienceFilter': campaign['audienceFilter'],
+          },
+        );
+        audiencePreview = data is Map
+            ? Map<String, dynamic>.from(data)
+            : <String, dynamic>{};
+        if ((int.tryParse('${audiencePreview['total'] ?? 0}') ?? 0) == 0) {
+          setState(() => error = 'لا يوجد مستلمون يطابقون الاستهداف الحالي.');
+          return;
+        }
+        final channels = (campaign['channels'] as List?)?.cast<String>() ?? [];
+        if (channels.contains('IN_APP') &&
+            (int.tryParse('${audiencePreview['inAppEligible'] ?? 0}') ?? 0) ==
+                0) {
+          setState(
+            () => error = 'المستلمون المحددون غير مرتبطين بحسابات دخول، لذلك لا يمكن إرسال إشعار داخل التطبيق لهم.',
+          );
+          return;
+        }
+      } catch (exception) {
+        setState(() => error = _errorMessage(exception));
+        return;
+      } finally {
+        if (mounted) setState(() => saving = false);
+      }
+    }
+    if (!mounted) return;
     final accepted = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text(widget.workflow.title),
-        content: const Text('راجع البيانات قبل إرسالها إلى نظام الإنتاج.'),
+        content: audiencePreview == null
+            ? const Text('راجع البيانات قبل إرسالها إلى نظام الإنتاج.')
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text('نتيجة معاينة الجمهور قبل الإرسال:'),
+                  const SizedBox(height: 12),
+                  Text(
+                    '${audiencePreview['total'] ?? 0} مستلم مطابق',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  Text(
+                    '${audiencePreview['inAppEligible'] ?? 0} يمكنهم استقبال الإشعار داخل التطبيق',
+                    style: const TextStyle(height: 1.6),
+                  ),
+                ],
+              ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -17015,6 +18490,66 @@ class _WorkflowPageState extends State<WorkflowPage> {
             ),
           );
         }
+      }
+      if (widget.workflow.operationId == 'createBarcodePrintBatch' &&
+          result is Map &&
+          result['items'] is List &&
+          mounted) {
+        final items = (result['items'] as List)
+            .whereType<Map>()
+            .map(Map<String, dynamic>.from)
+            .toList();
+        await showDialog<void>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text('دفعة الباركود جاهزة (${items.length})'),
+            content: SizedBox(
+              width: 420,
+              height: MediaQuery.sizeOf(dialogContext).height * .6,
+              child: ListView.separated(
+                itemCount: items.length,
+                separatorBuilder: (_, _) => const Divider(height: 28),
+                itemBuilder: (_, index) {
+                  final item = items[index];
+                  final code =
+                      item['credentialValue']?.toString() ??
+                      item['barcodeValue']?.toString() ??
+                      '';
+                  return Column(
+                    children: [
+                      Text(
+                        item['subjectName']?.toString() ??
+                            item['memberName']?.toString() ??
+                            'بطاقة ${index + 1}',
+                        style: const TextStyle(fontWeight: FontWeight.w900),
+                      ),
+                      const SizedBox(height: 10),
+                      if (code.isNotEmpty)
+                        Container(
+                          color: Colors.white,
+                          padding: const EdgeInsets.all(10),
+                          child: barcode_ui.BarcodeWidget(
+                            barcode: barcode_ui.Barcode.code39(),
+                            data: code,
+                            height: 72,
+                            drawText: true,
+                            color: Colors.black,
+                            backgroundColor: Colors.white,
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            actions: [
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('تم'),
+              ),
+            ],
+          ),
+        );
       }
       if (mounted) Navigator.pop(context, true);
     } catch (exception) {
@@ -17397,6 +18932,38 @@ MobileWorkflow? _workflowForFeature(ResourceFeature feature) {
       .firstOrNull;
 }
 
+List<MobileWorkflow> _workflowsForFeature(ResourceFeature feature) {
+  final primary = _workflowForFeature(feature);
+  final additionalIds = switch (feature.path) {
+    '/organizations/{organizationId}/services' => const [
+      'scheduleServiceAvailability',
+    ],
+    '/organizations/{organizationId}/bookable-resources' => const [
+      'createBookingAvailability',
+      'createBookingBlackout',
+      'createSessionSlot',
+    ],
+    '/organizations/{organizationId}/employees' => const ['assignEmployee'],
+    '/organizations/{organizationId}/subscriptions' => const [
+      'rescheduleSubscriptionStart',
+    ],
+    '/organizations/{organizationId}/trainers' => const [
+      'assignTrainerToBranch',
+      'createTrainerAvailability',
+      'assignMemberToTrainer',
+    ],
+    '/organizations/{organizationId}/restaurant-orders' => const [
+      'redeemMealPlan',
+    ],
+    '/organizations/{organizationId}/access-credentials' => const [
+      'createBarcodePrintBatch',
+      'assignFingerprintPin',
+    ],
+    _ => const <String>[],
+  };
+  return <MobileWorkflow>[?primary, ...additionalIds.map(_workflowById)];
+}
+
 MobileWorkflow? _editWorkflowForFeature(
   GoController controller,
   ResourceFeature feature,
@@ -17414,6 +18981,17 @@ MobileWorkflow? _editWorkflowForFeature(
     '/organizations/{organizationId}/facilities': 'bookings.facilities.manage',
     '/organizations/{organizationId}/bookable-resources':
         'bookings.facilities.manage',
+    '/organizations/{organizationId}/trainers': 'coaching.manage',
+    '/organizations/{organizationId}/employees': 'workforce.manage',
+    '/organizations/{organizationId}/crm/lead-sources': 'crm.leads.manage',
+    '/organizations/{organizationId}/crm/leads': 'crm.leads.manage',
+    '/organizations/{organizationId}/crm/follow-ups': 'crm.follow-ups.manage',
+    '/organizations/{organizationId}/communication-templates':
+        'notification-templates.manage',
+    '/organizations/{organizationId}/packages': 'commercial.manage',
+    '/organizations/{organizationId}/promotions': 'promotions.manage',
+    '/organizations/{organizationId}/prices': 'pricing.manage',
+    '/organizations/{organizationId}/retail/prices': 'retail.pricing.manage',
     '/organizations/{organizationId}/roles': 'iam.roles.manage',
     '/organizations/{organizationId}/notification-templates':
         'notification-templates.manage',
@@ -17900,6 +19478,669 @@ MobileWorkflow? _editWorkflowForFeature(
           'expectedVersion': version,
         },
       );
+    case '/organizations/{organizationId}/promotions':
+      final targets = row['targets'] is List
+          ? (row['targets'] as List).whereType<Map>().toList()
+          : const <Map>[];
+      String targetIds(String type) => targets
+          .where((item) => item['type']?.toString() == type)
+          .map((item) => (item['id'] ?? item['targetId'] ?? '').toString())
+          .where((item) => item.isNotEmpty)
+          .join(',');
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم العرض',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'benefitType',
+            label: 'نوع الفائدة',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('benefitType'),
+            choices: const [
+              WorkflowChoice('PERCENTAGE', 'خصم بالنسبة'),
+              WorkflowChoice('FIXED_DISCOUNT', 'خصم مبلغ ثابت'),
+              WorkflowChoice('FIXED_FINAL_PRICE', 'سعر نهائي ثابت'),
+            ],
+          ),
+          WorkflowField(
+            name: 'benefitValue',
+            label: 'قيمة العرض',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue:
+                ((num.tryParse('${row['benefitValue'] ?? 0}') ?? 0) / 100)
+                    .toString(),
+          ),
+          WorkflowField(
+            name: 'eligibility',
+            label: 'طريقة التطبيق',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('eligibility'),
+            choices: const [
+              WorkflowChoice('EVERYONE', 'تلقائي للجميع'),
+              WorkflowChoice('NEW_MEMBER', 'للأعضاء الجدد'),
+              WorkflowChoice('FORMER_MEMBER', 'للأعضاء السابقين'),
+              WorkflowChoice('PROMO_CODE', 'يدوي بكود الخصم'),
+            ],
+          ),
+          WorkflowField(
+            name: 'validFrom',
+            label: 'يبدأ العرض',
+            type: WorkflowFieldType.dateTime,
+            required: true,
+            initialValue: value('validFrom'),
+          ),
+          WorkflowField(
+            name: 'validUntil',
+            label: 'ينتهي العرض',
+            type: WorkflowFieldType.dateTime,
+            required: true,
+            initialValue: value('validUntil'),
+          ),
+          WorkflowField(
+            name: 'branchIds',
+            label: 'الفروع المستهدفة',
+            type: WorkflowFieldType.multiReference,
+            initialValue: _initialIds(row['branchIds']),
+            referencePath: '/organizations/{organizationId}/branches',
+            labelKeys: const ['name', 'nameAr'],
+            subtitleKeys: const ['code'],
+          ),
+          WorkflowField(
+            name: 'packageIds',
+            label: 'الباقات المشمولة',
+            type: WorkflowFieldType.multiReference,
+            initialValue: targetIds('PACKAGE'),
+            referencePath: '/organizations/{organizationId}/packages',
+            labelKeys: const ['name'],
+            subtitleKeys: const ['code'],
+          ),
+          WorkflowField(
+            name: 'serviceIds',
+            label: 'الخدمات المشمولة',
+            type: WorkflowFieldType.multiReference,
+            initialValue: targetIds('SERVICE'),
+            referencePath: '/organizations/{organizationId}/services',
+            labelKeys: const ['name'],
+            subtitleKeys: const ['code'],
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'name': values['name']?.trim(),
+          'benefitType': values['benefitType'],
+          'benefitValue':
+              ((double.tryParse(values['benefitValue'] ?? '') ?? 0) * 100)
+                  .round(),
+          'eligibility': values['eligibility'],
+          'validFrom': _asIso(values['validFrom']),
+          'validUntil': _asIso(values['validUntil']),
+          'branchIds': _selectedValues(values['branchIds']),
+          'targets': [
+            ..._selectedValues(values['packageIds'])
+                .map((id) => {'type': 'PACKAGE', 'id': id}),
+            ..._selectedValues(values['serviceIds'])
+                .map((id) => {'type': 'SERVICE', 'id': id}),
+          ],
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/packages':
+      final entitlements = row['entitlements'] is List
+          ? (row['entitlements'] as List).whereType<Map>().toList()
+          : const <Map>[];
+      final currentMealAllowance = entitlements
+          .map((item) => item['visitAllowance'])
+          .where((item) => item != null)
+          .map((item) => item.toString())
+          .firstOrNull;
+      final currentFrequency = value('visitLimitPeriod').isNotEmpty
+          ? value('visitLimitPeriod')
+          : row['visitAllowance'] != null
+          ? 'TOTAL'
+          : 'UNLIMITED';
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم الباقة',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'fulfillmentKind',
+            label: 'نوع الباقة',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('fulfillmentKind'),
+            choices: const [
+              WorkflowChoice('FACILITY_ACCESS', 'دخول مرفق'),
+              WorkflowChoice('SESSION', 'جلسات'),
+              WorkflowChoice('MEAL_PLAN', 'خطة وجبات'),
+            ],
+          ),
+          WorkflowField(
+            name: 'durationDays',
+            label: 'المدة الفعلية بالأيام',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: value('durationDays'),
+          ),
+          WorkflowField(
+            name: 'mealAllowance',
+            label: 'عدد الوجبات في الخطة',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: currentMealAllowance ?? value('visitAllowance'),
+            visibleWhenField: 'fulfillmentKind',
+            visibleWhenValues: const ['MEAL_PLAN'],
+          ),
+          WorkflowField(
+            name: 'accessFrequency',
+            label: 'نظام الحضور',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: currentFrequency,
+            choices: const [
+              WorkflowChoice('UNLIMITED', 'غير محدود'),
+              WorkflowChoice('TOTAL', 'إجمالي طوال الباقة'),
+              WorkflowChoice('WEEK', 'حد أسبوعي'),
+              WorkflowChoice('MONTH', 'حد شهري'),
+            ],
+          ),
+          WorkflowField(
+            name: 'visitAllowance',
+            label: 'إجمالي مرات الحضور',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: value('visitAllowance'),
+            visibleWhenField: 'accessFrequency',
+            visibleWhenValues: const ['TOTAL'],
+          ),
+          WorkflowField(
+            name: 'visitsPerPeriod',
+            label: 'مرات الحضور في الفترة',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: value('visitsPerPeriod'),
+            visibleWhenField: 'accessFrequency',
+            visibleWhenValues: const ['WEEK', 'MONTH'],
+          ),
+          WorkflowField(
+            name: 'branchAccessPolicy',
+            label: 'سياسة الوصول للفروع',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('branchAccessPolicy'),
+            choices: const [
+              WorkflowChoice('SINGLE_BRANCH', 'فرع البيع فقط'),
+              WorkflowChoice('SELECTED_BRANCHES', 'فروع مختارة'),
+              WorkflowChoice('ALL_ORGANIZATION_BRANCHES', 'كل الفروع'),
+            ],
+          ),
+          WorkflowField(
+            name: 'branchIds',
+            label: 'الفروع المتاحة',
+            type: WorkflowFieldType.multiReference,
+            initialValue: _initialIds(row['branchIds']),
+            referencePath: '/organizations/{organizationId}/branches',
+            labelKeys: const ['name', 'nameAr'],
+            subtitleKeys: const ['code'],
+            visibleWhenField: 'branchAccessPolicy',
+            visibleWhenValues: const ['SELECTED_BRANCHES'],
+          ),
+          WorkflowField(
+            name: 'serviceIds',
+            label: 'الخدمات المشمولة',
+            type: WorkflowFieldType.multiReference,
+            required: true,
+            initialValue: _initialIds(row['entitlements']),
+            referencePath: '/organizations/{organizationId}/services',
+            labelKeys: const ['name'],
+            subtitleKeys: const ['code'],
+          ),
+          WorkflowField(
+            name: 'freezePolicyVersionId',
+            label: 'سياسة التجميد',
+            type: WorkflowFieldType.reference,
+            initialValue: value('freezePolicyVersionId'),
+            referencePath:
+                '/organizations/{organizationId}/commercial-policies',
+            labelKeys: const ['name'],
+            subtitleKeys: const ['policyType', 'versionNumber'],
+          ),
+          WorkflowField(
+            name: 'cancellationPolicyVersionId',
+            label: 'سياسة إلغاء الاشتراك',
+            type: WorkflowFieldType.reference,
+            initialValue: value('cancellationPolicyVersionId'),
+            referencePath:
+                '/organizations/{organizationId}/commercial-policies',
+            labelKeys: const ['name'],
+            subtitleKeys: const ['policyType', 'versionNumber'],
+          ),
+          WorkflowField(
+            name: 'renewalPolicyVersionId',
+            label: 'سياسة التجديد',
+            type: WorkflowFieldType.reference,
+            initialValue: value('renewalPolicyVersionId'),
+            referencePath:
+                '/organizations/{organizationId}/commercial-policies',
+            labelKeys: const ['name'],
+            subtitleKeys: const ['policyType', 'versionNumber'],
+          ),
+          WorkflowField(
+            name: 'description',
+            label: 'الوصف',
+            type: WorkflowFieldType.textarea,
+            initialValue: value('description'),
+          ),
+          statusField(
+            choices: const [
+              WorkflowChoice('DRAFT', 'مسودة'),
+              WorkflowChoice('PUBLISHED', 'منشورة'),
+              WorkflowChoice('INACTIVE', 'مؤرشفة'),
+            ],
+          ),
+        ],
+        body: (values, controller) {
+          final mealPlan = values['fulfillmentKind'] == 'MEAL_PLAN';
+          final frequency = values['accessFrequency'];
+          final allowance = mealPlan
+              ? int.tryParse(values['mealAllowance'] ?? '')
+              : frequency == 'TOTAL'
+              ? int.tryParse(values['visitAllowance'] ?? '')
+              : null;
+          final periodic =
+              !mealPlan && (frequency == 'WEEK' || frequency == 'MONTH');
+          return {
+            'name': values['name']?.trim(),
+            if (values['description']?.isNotEmpty == true)
+              'description': values['description']?.trim(),
+            'contract': row['contract'],
+            'durationDays': int.tryParse(values['durationDays'] ?? '') ?? 1,
+            'visitAllowance': allowance,
+            'visitLimitPeriod': periodic ? frequency : null,
+            'visitsPerPeriod': periodic
+                ? int.tryParse(values['visitsPerPeriod'] ?? '')
+                : null,
+            'fulfillmentKind': values['fulfillmentKind'],
+            'branchAccessPolicy': values['branchAccessPolicy'],
+            'branchIds': _selectedValues(values['branchIds']),
+            'entitlements': _selectedValues(values['serviceIds'])
+                .map(
+                  (serviceId) => {
+                    'serviceId': serviceId,
+                    if (mealPlan && allowance != null)
+                      'visitAllowance': allowance,
+                  },
+                )
+                .toList(growable: false),
+            if (values['freezePolicyVersionId']?.isNotEmpty == true)
+              'freezePolicyVersionId': values['freezePolicyVersionId'],
+            if (values['cancellationPolicyVersionId']?.isNotEmpty == true)
+              'cancellationPolicyVersionId':
+                  values['cancellationPolicyVersionId'],
+            if (values['renewalPolicyVersionId']?.isNotEmpty == true)
+              'renewalPolicyVersionId': values['renewalPolicyVersionId'],
+            'status': values['status'],
+            'expectedVersion': version,
+          };
+        },
+      );
+    case '/organizations/{organizationId}/trainers':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'displayName',
+            label: 'اسم المدرب الظاهر',
+            required: true,
+            initialValue: value('displayName'),
+          ),
+          WorkflowField(
+            name: 'publicBio',
+            label: 'نبذة تظهر للأعضاء',
+            type: WorkflowFieldType.textarea,
+            initialValue: value('publicBio'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'displayName': values['displayName']?.trim(),
+          'publicBio': values['publicBio']?.trim().isEmpty == true
+              ? null
+              : values['publicBio']?.trim(),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/employees':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم الموظف',
+            required: true,
+            initialValue: value('name').isEmpty
+                ? value('displayName')
+                : value('name'),
+          ),
+          WorkflowField(
+            name: 'phone',
+            label: 'رقم الجوال',
+            type: WorkflowFieldType.phone,
+            initialValue: value('phoneE164').isEmpty
+                ? value('phone')
+                : value('phoneE164'),
+          ),
+          WorkflowField(
+            name: 'email',
+            label: 'البريد الإلكتروني',
+            type: WorkflowFieldType.email,
+            initialValue: value('email'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'name': values['name']?.trim(),
+          'phone': values['phone']?.trim().isEmpty == true
+              ? null
+              : values['phone']?.trim(),
+          'email': values['email']?.trim().isEmpty == true
+              ? null
+              : values['email']?.trim(),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/crm/lead-sources':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'nameAr',
+            label: 'الاسم العربي',
+            required: true,
+            initialValue: value('nameAr'),
+          ),
+          WorkflowField(
+            name: 'nameEn',
+            label: 'الاسم الإنجليزي',
+            initialValue: value('nameEn'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'nameAr': values['nameAr']?.trim(),
+          'nameEn': values['nameEn']?.trim().isEmpty == true
+              ? null
+              : values['nameEn']?.trim(),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/crm/leads':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'fullName',
+            label: 'اسم العميل المحتمل',
+            required: true,
+            initialValue: value('fullName'),
+          ),
+          WorkflowField(
+            name: 'phone',
+            label: 'رقم الجوال',
+            type: WorkflowFieldType.phone,
+            initialValue: value('phoneE164').isEmpty
+                ? value('phone')
+                : value('phoneE164'),
+          ),
+          WorkflowField(
+            name: 'email',
+            label: 'البريد الإلكتروني',
+            type: WorkflowFieldType.email,
+            initialValue: value('email'),
+          ),
+          WorkflowField(
+            name: 'notes',
+            label: 'ملاحظات',
+            type: WorkflowFieldType.textarea,
+            initialValue: value('notes'),
+          ),
+        ],
+        body: (values, controller) => {
+          'fullName': values['fullName']?.trim(),
+          'phone': values['phone']?.trim().isEmpty == true
+              ? null
+              : values['phone']?.trim(),
+          'email': values['email']?.trim().isEmpty == true
+              ? null
+              : values['email']?.trim(),
+          'notes': values['notes']?.trim(),
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/crm/follow-ups':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'assignedToUserAccountId',
+            label: 'الموظف المسؤول',
+            type: WorkflowFieldType.reference,
+            required: true,
+            initialValue: value('assignedToUserAccountId'),
+            referencePath: '/organizations/{organizationId}/user-accounts',
+            labelKeys: ['displayName', 'email'],
+            subtitleKeys: ['status'],
+          ),
+          WorkflowField(
+            name: 'channel',
+            label: 'قناة المتابعة',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('channel'),
+            choices: const [
+              WorkflowChoice('CALL', 'مكالمة'),
+              WorkflowChoice('WHATSAPP', 'واتساب'),
+              WorkflowChoice('SMS', 'رسالة نصية'),
+              WorkflowChoice('EMAIL', 'بريد إلكتروني'),
+              WorkflowChoice('VISIT', 'زيارة'),
+              WorkflowChoice('OTHER', 'أخرى'),
+            ],
+          ),
+          WorkflowField(
+            name: 'scheduledAt',
+            label: 'موعد المتابعة',
+            type: WorkflowFieldType.dateTime,
+            required: true,
+            initialValue: value('scheduledAt'),
+          ),
+          WorkflowField(
+            name: 'subject',
+            label: 'الموضوع',
+            initialValue: value('subject'),
+          ),
+          WorkflowField(
+            name: 'notes',
+            label: 'ملاحظات',
+            type: WorkflowFieldType.textarea,
+            initialValue: value('notes'),
+          ),
+        ],
+        body: (values, controller) => {
+          'assignedToUserAccountId': values['assignedToUserAccountId'],
+          'channel': values['channel'],
+          'scheduledAt': _asIso(values['scheduledAt']),
+          'subject': values['subject']?.trim().isEmpty == true
+              ? null
+              : values['subject']?.trim(),
+          'notes': values['notes']?.trim(),
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/communication-templates':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'name',
+            label: 'اسم القالب',
+            required: true,
+            initialValue: value('name'),
+          ),
+          WorkflowField(
+            name: 'purpose',
+            label: 'الغرض',
+            type: WorkflowFieldType.select,
+            required: true,
+            initialValue: value('purpose'),
+            choices: const [
+              WorkflowChoice('MARKETING', 'ترويج'),
+              WorkflowChoice('RENEWAL', 'تجديد'),
+              WorkflowChoice('REMINDER', 'تذكير'),
+              WorkflowChoice('ANNOUNCEMENT', 'إعلان'),
+              WorkflowChoice('FOLLOW_UP', 'متابعة'),
+              WorkflowChoice('OTHER', 'أخرى'),
+            ],
+          ),
+          WorkflowField(
+            name: 'title',
+            label: 'عنوان الرسالة',
+            required: true,
+            initialValue: value('title'),
+          ),
+          WorkflowField(
+            name: 'body',
+            label: 'نص الرسالة',
+            type: WorkflowFieldType.textarea,
+            required: true,
+            initialValue: value('body'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          if (row['branchId'] != null) 'branchId': row['branchId'],
+          'name': values['name']?.trim(),
+          'purpose': values['purpose'],
+          'title': values['title']?.trim(),
+          'body': values['body']?.trim(),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
+    case '/organizations/{organizationId}/prices':
+      final amount = row['amount'] is Map
+          ? (row['amount'] as Map)['minorUnits']
+          : row['amountMinor'];
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'amount',
+            label: 'السعر بالريال',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue: ((num.tryParse('${amount ?? 0}') ?? 0) / 100)
+                .toString(),
+          ),
+          WorkflowField(
+            name: 'taxRate',
+            label: 'نسبة الضريبة %',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue:
+                ((num.tryParse('${row['taxRateBps'] ?? 0}') ?? 0) / 100)
+                    .toString(),
+            allowZero: true,
+          ),
+          WorkflowField(
+            name: 'taxInclusive',
+            label: 'السعر شامل الضريبة',
+            type: WorkflowFieldType.checkbox,
+            initialValue: '${row['taxInclusive'] == true}',
+          ),
+          WorkflowField(
+            name: 'validFrom',
+            label: 'بداية السريان',
+            type: WorkflowFieldType.dateTime,
+            required: true,
+            initialValue: value('validFrom'),
+          ),
+          WorkflowField(
+            name: 'validUntil',
+            label: 'نهاية السريان (اختياري)',
+            type: WorkflowFieldType.dateTime,
+            autoFillDate: false,
+            initialValue: value('validUntil'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'amountMinor': _moneyMinor(values['amount']),
+          'taxRateBps': ((double.tryParse(values['taxRate'] ?? '') ?? 0) * 100)
+              .round(),
+          'taxInclusive': values['taxInclusive'] == 'true',
+          'validFrom': _asIso(values['validFrom']),
+          'validUntil': values['validUntil']?.isEmpty == true
+              ? null
+              : _asIso(values['validUntil']),
+          'status': values['status'],
+        },
+      );
+    case '/organizations/{organizationId}/retail/prices':
+      return edit(
+        fields: [
+          WorkflowField(
+            name: 'amount',
+            label: 'سعر البيع بالريال',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue:
+                ((num.tryParse('${row['amountMinor'] ?? 0}') ?? 0) / 100)
+                    .toString(),
+          ),
+          WorkflowField(
+            name: 'taxRate',
+            label: 'نسبة الضريبة %',
+            type: WorkflowFieldType.number,
+            required: true,
+            initialValue:
+                ((num.tryParse('${row['taxRateBps'] ?? 0}') ?? 0) / 100)
+                    .toString(),
+            allowZero: true,
+          ),
+          WorkflowField(
+            name: 'taxInclusive',
+            label: 'السعر شامل الضريبة',
+            type: WorkflowFieldType.checkbox,
+            initialValue: '${row['taxInclusive'] == true}',
+          ),
+          WorkflowField(
+            name: 'validUntil',
+            label: 'نهاية السريان (اختياري)',
+            type: WorkflowFieldType.dateTime,
+            autoFillDate: false,
+            initialValue: value('validUntil'),
+          ),
+          statusField(),
+        ],
+        body: (values, controller) => {
+          'branchId': row['branchId'] ?? controller.branchId,
+          'amountMinor': _moneyMinor(values['amount']),
+          'taxRateBps': ((double.tryParse(values['taxRate'] ?? '') ?? 0) * 100)
+              .round(),
+          'taxInclusive': values['taxInclusive'] == 'true',
+          if (values['validUntil']?.isNotEmpty == true)
+            'validUntil': _asIso(values['validUntil']),
+          'status': values['status'],
+          'expectedVersion': version,
+        },
+      );
     case '/organizations/{organizationId}/notification-templates':
       return edit(
         method: 'POST',
@@ -17934,7 +20175,8 @@ String _initialIds(dynamic value) {
   return value
       .map((item) {
         if (item is Map) {
-          return (item['id'] ??
+          return (item['serviceId'] ??
+                  item['id'] ??
                   item['mealId'] ??
                   item['activityId'] ??
                   item['code'] ??
@@ -17961,6 +20203,7 @@ bool _canRunWorkflow(GoController controller, MobileWorkflow workflow) {
   }
   final permission = <String, String>{
     'createSubscription': 'sales.checkout',
+    'rescheduleSubscriptionStart': 'subscriptions.adjustments.manage',
     'recordPayment': 'finance.payments.record',
     'recordSplitPayment': 'finance.payments.record',
     'createCrmLead': 'crm.leads.manage',
@@ -17973,12 +20216,14 @@ bool _canRunWorkflow(GoController controller, MobileWorkflow workflow) {
     'checkoutRetailAtPos': 'sales.checkout',
     'createManualReservation': 'bookings.create',
     'createEmployee': 'workforce.manage',
+    'assignEmployee': 'workforce.assignments.manage',
     'recordMeasurementSession': 'measurements.manage',
     'requestReportingRebuild': 'reporting.rebuild',
     'createBranch': 'branch.manage',
     'createActivity': 'catalog.manage',
     'createServiceCategory': 'catalog.manage',
     'createService': 'catalog.manage',
+    'scheduleServiceAvailability': 'catalog.manage',
     'createPackage': 'commercial.manage',
     'createPrice': 'pricing.manage',
     'createPromotion': 'promotions.manage',
@@ -17991,6 +20236,9 @@ bool _canRunWorkflow(GoController controller, MobileWorkflow workflow) {
     'createPosition': 'workforce.manage',
     'createFacility': 'bookings.facilities.manage',
     'createBookableResource': 'bookings.facilities.manage',
+    'createBookingAvailability': 'bookings.facilities.manage',
+    'createBookingBlackout': 'bookings.facilities.manage',
+    'createSessionSlot': 'bookings.facilities.manage',
     'createRole': 'iam.roles.manage',
     'createRoleAssignment': 'iam.assignments.manage',
     'createNotificationTemplate': 'notification-templates.manage',
@@ -18004,10 +20252,15 @@ bool _canRunWorkflow(GoController controller, MobileWorkflow workflow) {
     'createRestaurantMealPrice': 'restaurant.pricing.manage',
     'createDailyMenu': 'restaurant.menu.manage',
     'issueAccessBarcode': 'access-credentials.manage',
+    'createBarcodePrintBatch': 'access-credentials.manage',
     'assignFingerprintPin': 'access-credentials.manage',
     'registerAccessDevice': 'attendance.devices.manage',
     'createCoachingSpecialty': 'coaching.manage',
     'createTrainerProfile': 'coaching.manage',
+    'assignTrainerToBranch': 'coaching.assignments.manage',
+    'createTrainerAvailability': 'coaching.schedule.manage',
+    'assignMemberToTrainer': 'coaching.assignments.manage',
+    'redeemMealPlan': 'restaurant.meal-plans.redeem',
     'createOtherIncomeCategory': 'finance.other-income.manage',
     'createCommunicationTemplate': 'notification-templates.manage',
     'createCommunicationCampaign': 'notifications.send',

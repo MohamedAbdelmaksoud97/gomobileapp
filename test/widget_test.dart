@@ -46,6 +46,90 @@ void main() {
     expect(attendance, isNot(contains('limit')));
   });
 
+  test('mobile workflows cover high-value web mutations', () {
+    final operations = mobileWorkflows.map((workflow) => workflow.operationId);
+    expect(
+      operations,
+      containsAll(<String>[
+        'createSubscription',
+        'rescheduleSubscriptionStart',
+        'recordSplitPayment',
+        'scheduleServiceAvailability',
+        'createBookingAvailability',
+        'createBookingBlackout',
+        'createSessionSlot',
+        'assignEmployee',
+        'assignTrainerToBranch',
+        'createTrainerAvailability',
+        'assignMemberToTrainer',
+        'createBarcodePrintBatch',
+        'redeemMealPlan',
+        'createCommunicationCampaign',
+      ]),
+    );
+  });
+
+  test('booking and communication workflows enforce backend UX rules', () {
+    final booking = mobileWorkflows.firstWhere(
+      (workflow) => workflow.operationId == 'createBookableResource',
+    );
+    final controller = GoController(ApiClient(baseUrl: ''))
+      ..branchId = 'branch-test';
+    expect(
+      booking.body({
+        'facilityId': 'facility-test',
+        'serviceId': 'service-test',
+        'cancellationPolicyVersionId': 'policy-test',
+        'code': 'court-1',
+        'name': 'ملعب تجريبي',
+        'type': 'COURT',
+        'capacity': '12',
+      }, controller)['capacity'],
+      1,
+    );
+    expect(
+      booking.body({
+        'facilityId': 'facility-test',
+        'serviceId': 'service-test',
+        'cancellationPolicyVersionId': 'policy-test',
+        'code': 'class-1',
+        'name': 'حصة تجريبية',
+        'type': 'CLASS',
+        'capacity': '12',
+      }, controller)['capacity'],
+      12,
+    );
+
+    final campaign = mobileWorkflows.firstWhere(
+      (workflow) => workflow.operationId == 'createCommunicationCampaign',
+    );
+    final template = campaign.fields.firstWhere(
+      (field) => field.name == 'templateId',
+    );
+    expect(template.copyValues, {
+      'title': 'title',
+      'body': 'body',
+      'purpose': 'purpose',
+    });
+    controller.dispose();
+  });
+
+  test('restaurant pricing supports a publication-safe effective date', () {
+    final pricing = mobileWorkflows.firstWhere(
+      (workflow) => workflow.operationId == 'createRestaurantMealPrice',
+    );
+    final validFrom = pricing.fields.firstWhere(
+      (field) => field.name == 'validFrom',
+    );
+    expect(validFrom.type, WorkflowFieldType.dateTime);
+    expect(validFrom.required, isTrue);
+    expect(DateTime.tryParse(validFrom.initialValue), isNotNull);
+    expect(
+      apiProblemMessage('daily_menu_price_missing', 'fallback'),
+      contains('سعر ساري'),
+    );
+  });
+
   testWidgets('GO login experience renders', (tester) async {
     tester.view.physicalSize = const Size(400, 850);
     tester.view.devicePixelRatio = 1;
@@ -174,6 +258,54 @@ void main() {
     expect(find.text('مساحة عملي', skipOffstage: false), findsOneWidget);
     expect(find.text('العمليات المتقدمة', skipOffstage: false), findsNothing);
     expect(find.text('الإجراءات الأساسية', skipOffstage: false), findsNothing);
+    expect(tester.takeException(), isNull);
+    controller.dispose();
+  });
+
+  testWidgets('CRM workspace mirrors web summary and workflow sections', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(400, 850);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final controller = GoController(ApiClient(baseUrl: ''))
+      ..grants = [
+        {
+          'permission': 'crm.leads.manage',
+          'organizationId': 'demo-organization',
+          'scopeType': 'ORGANIZATION',
+          'branchIds': <String>[],
+        },
+        {
+          'permission': 'crm.follow-ups.manage',
+          'organizationId': 'demo-organization',
+          'scopeType': 'ORGANIZATION',
+          'branchIds': <String>[],
+        },
+        {
+          'permission': 'online-requests.read',
+          'organizationId': 'demo-organization',
+          'scopeType': 'ORGANIZATION',
+          'branchIds': <String>[],
+        },
+      ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Directionality(
+          textDirection: TextDirection.rtl,
+          child: CrmMobileWorkspacePage(controller: controller),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('فرص مفتوحة'), findsOneWidget);
+    expect(find.text('متابعات مجدولة'), findsOneWidget);
+    expect(find.text('متابعات متأخرة'), findsOneWidget);
+    expect(find.text('تحولوا إلى أعضاء'), findsOneWidget);
+    expect(find.text('العملاء المحتملون'), findsOneWidget);
+    expect(find.text('جدول المتابعات'), findsOneWidget);
     expect(tester.takeException(), isNull);
     controller.dispose();
   });
