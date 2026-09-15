@@ -4,7 +4,22 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:gomobileapp/main.dart';
 
 class _RecordingApiClient extends ApiClient {
-  _RecordingApiClient() : super(baseUrl: '');
+  _RecordingApiClient({
+    this.resourceId = 'resource-1',
+    this.resourceType = 'CLASS',
+    this.withAvailability = true,
+  }) : super(baseUrl: '');
+  final String resourceId;
+  final String resourceType;
+  final bool withAvailability;
+  static const availability = {
+    'id': 'availability-1',
+    'dayOfWeek': 0,
+    'startLocal': '08:00',
+    'endLocal': '22:00',
+    'validFrom': '2026-01-01',
+    'validUntil': '2030-12-31',
+  };
 
   final calls = <Map<String, dynamic>>[];
 
@@ -42,14 +57,19 @@ class _RecordingApiClient extends ApiClient {
       final memberPath = path.startsWith('/self/');
       return [
         {
-          'id': 'resource-1',
+          'id': resourceId,
           'name': 'حصة تجريبية',
-          'type': 'CLASS',
-          'resourceType': 'CLASS',
+          'type': resourceType,
+          'resourceType': resourceType,
+          'timezone': 'Asia/Riyadh',
+          'availabilityRules': withAvailability ? [availability] : [],
           'serviceId': 'service-1',
           if (memberPath) 'facilityName': 'القاعة الرئيسية',
         },
       ];
+    }
+    if (path.endsWith('/availability-rules')) {
+      return withAvailability ? [availability] : [];
     }
     if (path.endsWith('/session-slots')) {
       final start = DateTime.now().toUtc().add(const Duration(days: 2));
@@ -76,6 +96,125 @@ void main() {
 
   test('production API is the default runtime target', () {
     expect(ApiClient().baseUrl, productionApiBaseUrl);
+  });
+
+  test('availability labels include weekday, hours and effective dates', () {
+    expect(
+      bookingAvailabilityLabel(
+        Map<String, dynamic>.from(_RecordingApiClient.availability),
+      ),
+      'الأحد: 08:00 – 22:00 · من 2026-01-01 حتى 2030-12-31',
+    );
+  });
+
+  test(
+    'slot period displays both hours in branch timezone, not relative now',
+    () {
+      final slot = {
+        'startsAt': '2030-09-16T05:00:00Z',
+        'endsAt': '2030-09-16T06:00:00Z',
+      };
+      expect(bookingSlotPeriodLabel(slot), '16/09/2030 · 08:00 – 09:00');
+      expect(
+        bookingSlotPeriodLabel(slot, zone: 'Europe/London'),
+        '16/09/2030 · 06:00 – 07:00',
+      );
+      expect(bookingSlotPeriodLabel({}), 'موعد غير صالح');
+    },
+  );
+
+  for (final staff in [false, true]) {
+    testWidgets(
+      '${staff ? 'staff' : 'member'} booking displays resource availability before choosing a time',
+      (tester) async {
+        final api = _RecordingApiClient();
+        final controller = GoController(api)
+          ..staffMode = staff
+          ..organizationId = 'organization-1'
+          ..branchId = 'branch-1'
+          ..selfMembers = [
+            {'memberId': 'member-1', 'canBook': true},
+          ];
+        await tester.pumpWidget(
+          MaterialApp(
+            home: WorkflowPage(
+              controller: controller,
+              workflow: mobileWorkflows.firstWhere(
+                (item) =>
+                    item.operationId ==
+                    (staff ? 'createManualReservation' : 'checkoutSelfBooking'),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('فترات الإتاحة'), findsOneWidget);
+        expect(find.textContaining('الأحد: 08:00 – 22:00'), findsOneWidget);
+        expect(
+          api.calls.any(
+            (call) =>
+                call['path'].toString().startsWith('/organizations/') &&
+                call['path'].toString().endsWith('/availability-rules'),
+          ),
+          staff,
+        );
+        expect(tester.takeException(), isNull);
+        controller.dispose();
+      },
+    );
+  }
+
+  testWidgets('member cannot submit court booking with empty availability', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(412, 915);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final api = _RecordingApiClient(
+      resourceType: 'COURT',
+      withAvailability: false,
+    );
+    final controller = GoController(api)
+      ..staffMode = false
+      ..organizationId = 'organization-1'
+      ..branchId = 'branch-1'
+      ..selfMembers = [
+        {'memberId': 'member-1', 'canBook': true},
+      ];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: WorkflowPage(
+          controller: controller,
+          workflow: mobileWorkflows.firstWhere(
+            (item) => item.operationId == 'checkoutSelfBooking',
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.text('لا توجد فترات إتاحة سارية أو قادمة لهذا المورد.'),
+      findsOneWidget,
+    );
+    await tester.scrollUntilVisible(
+      find.text('تأكيد الحجز'),
+      300,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.ensureVisible(find.text('تأكيد الحجز'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('تأكيد الحجز'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('لا يمكن تأكيد الحجز قبل تحميل فترات الإتاحة لهذا المورد.'),
+      findsOneWidget,
+    );
+    expect(
+      api.calls.any((call) => call['path'].toString().endsWith('/orders')),
+      isFalse,
+    );
+    controller.dispose();
   });
 
   test('Riyadh ranges and strict resource queries match backend contracts', () {
@@ -422,7 +561,10 @@ void main() {
   testWidgets(
     'member court booking reserves one unit with participant count and no session-slot request',
     (tester) async {
-      final api = _RecordingApiClient();
+      final api = _RecordingApiClient(
+        resourceId: 'court-1',
+        resourceType: 'COURT',
+      );
       final controller = GoController(api)
         ..staffMode = false
         ..organizationId = 'organization-1'

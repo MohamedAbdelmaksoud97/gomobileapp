@@ -15,6 +15,8 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:timezone/data/latest.dart' as timezone_data;
+import 'package:timezone/timezone.dart' as timezone;
 
 // The web brand token and the supplied artwork's primary yellow.
 const goYellow = Color(0xFFFFCC00);
@@ -18485,6 +18487,115 @@ Future<void> _openWorkflow(
       .showSnackBar(SnackBar(content: Text(workflow.successMessage)));
 }
 
+bool _bookingTimezonesReady = false;
+
+String bookingSlotPeriodLabel(Map row, {String zone = 'Asia/Riyadh'}) {
+  final start = DateTime.tryParse('${row['startsAt']}');
+  final end = DateTime.tryParse('${row['endsAt']}');
+  if (start == null || end == null) return 'موعد غير صالح';
+  if (!_bookingTimezonesReady) {
+    timezone_data.initializeTimeZones();
+    _bookingTimezonesReady = true;
+  }
+  final location = timezone.getLocation(zone);
+  final localStart = timezone.TZDateTime.from(start, location);
+  final localEnd = timezone.TZDateTime.from(end, location);
+  String time(DateTime value) =>
+      '${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
+  return '${localStart.day.toString().padLeft(2, '0')}/${localStart.month.toString().padLeft(2, '0')}/${localStart.year} · ${time(localStart)} – ${time(localEnd)}';
+}
+
+String bookingAvailabilityLabel(Map<String, dynamic> rule) {
+  const days = [
+    'الأحد',
+    'الاثنين',
+    'الثلاثاء',
+    'الأربعاء',
+    'الخميس',
+    'الجمعة',
+    'السبت',
+  ];
+  final day = int.tryParse('${rule['dayOfWeek']}');
+  String short(dynamic value) =>
+      value?.toString().split(':').take(2).join(':') ?? '';
+  return '${day != null && day >= 0 && day < 7 ? days[day] : 'يوم غير محدد'}: ${short(rule['startLocal'])} – ${short(rule['endLocal'])}'
+      '${rule['validFrom'] != null ? ' · من ${rule['validFrom']}${rule['validUntil'] != null ? ' حتى ${rule['validUntil']}' : ' دون تاريخ انتهاء'}' : ''}';
+}
+
+class BookingAvailabilityCard extends StatelessWidget {
+  const BookingAvailabilityCard({
+    super.key,
+    required this.rules,
+    this.loading = false,
+    this.error,
+    this.timezone = '',
+    this.onRetry,
+  });
+  final List<Map<String, dynamic>> rules;
+  final bool loading;
+  final String? error;
+  final String timezone;
+  final Future<void> Function()? onRetry;
+
+  @override
+  Widget build(BuildContext context) => Card(
+    margin: const EdgeInsets.only(bottom: 16),
+    child: Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.access_time_rounded, size: 20),
+              SizedBox(width: 8),
+              Text(
+                'فترات الإتاحة',
+                style: TextStyle(fontWeight: FontWeight.w900),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (loading)
+            const LinearProgressIndicator()
+          else if (error != null) ...[
+            Text(
+              error!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+            if (onRetry != null)
+              TextButton.icon(
+                onPressed: () => unawaited(onRetry!()),
+                icon: const Icon(Icons.refresh),
+                label: const Text('إعادة تحميل الإتاحة'),
+              ),
+          ] else if (rules.isEmpty)
+            const Text('لا توجد فترات إتاحة سارية أو قادمة لهذا المورد.')
+          else
+            ...rules.map(
+              (rule) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  bookingAvailabilityLabel(rule),
+                  style: const TextStyle(fontSize: 12, height: 1.7),
+                ),
+              ),
+            ),
+          const SizedBox(height: 8),
+          Text(
+            'الساعات بتوقيت الفرع${timezone.isNotEmpty ? ' ($timezone)' : ''}. هذه فترات التشغيل، وليست ضمانًا لشغور الوقت؛ يتحقق النظام من الحجوزات والحجب عند التأكيد.',
+            style: TextStyle(
+              fontSize: 11,
+              height: 1.7,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 class WorkflowPage extends StatefulWidget {
   const WorkflowPage({
     super.key,
@@ -18511,6 +18622,97 @@ class _WorkflowPageState extends State<WorkflowPage> {
   bool loadingReferences = true;
   bool saving = false;
   String? error;
+  List<Map<String, dynamic>> bookingAvailability = [];
+  bool loadingAvailability = false;
+  String? availabilityError;
+  String availabilityTimezone = '';
+  int availabilityGeneration = 0;
+
+  bool get isReservation => const {
+    'createManualReservation',
+    'checkoutSelfBooking',
+  }.contains(widget.workflow.operationId);
+
+  Future<void> _loadBookingAvailability() async {
+    if (!isReservation) return;
+    final resource = controllers['resourceId']?.text ?? '';
+    final current = ++availabilityGeneration;
+    setState(() {
+      bookingAvailability = [];
+      availabilityError = null;
+      availabilityTimezone = '';
+      loadingAvailability = resource.isNotEmpty;
+    });
+    if (resource.isEmpty) return;
+    try {
+      dynamic rules;
+      String timezone =
+          widget.controller.branches
+              .where(
+                (branch) =>
+                    branch['id']?.toString() == widget.controller.branchId,
+              )
+              .firstOrNull?['timezone']
+              ?.toString() ??
+          'Asia/Riyadh';
+      if (widget.workflow.operationId == 'checkoutSelfBooking') {
+        final data = await widget.controller.api.request(
+          '/self/organizations/${widget.controller.organizationId}/bookable-resources',
+          query: {'branchId': widget.controller.branchId},
+        );
+        final rows = data is List
+            ? data
+            : data is Map
+            ? data['items']
+            : null;
+        final selected = rows is List
+            ? rows
+                  .whereType<Map>()
+                  .where((row) => row['id']?.toString() == resource)
+                  .firstOrNull
+            : null;
+        rules = selected?['availabilityRules'];
+        timezone = selected?['timezone']?.toString() ?? '';
+        if (rules is! List) {
+          throw Exception(
+            'لم تصل بيانات الإتاحة لهذا المورد. حدّث بيانات الخادم ثم حاول مجددًا.',
+          );
+        }
+      } else {
+        final data = await widget.controller.api.request(
+          '/organizations/${widget.controller.organizationId}/bookable-resources/$resource/availability-rules',
+        );
+        rules = data is List
+            ? data
+            : data is Map
+            ? data['items']
+            : null;
+        if (rules is! List) {
+          throw Exception('تعذر تحميل فترات الإتاحة. حاول مجددًا.');
+        }
+      }
+      if (!mounted || current != availabilityGeneration) return;
+      setState(() {
+        bookingAvailability = (rules as List)
+            .whereType<Map>()
+            .map(Map<String, dynamic>.from)
+            .toList();
+        availabilityTimezone = timezone;
+        for (final slot
+            in references['sessionSlotId'] ?? <Map<String, dynamic>>[]) {
+          slot['timezone'] = timezone.isEmpty ? 'Asia/Riyadh' : timezone;
+        }
+      });
+    } catch (exception) {
+      if (mounted && current == availabilityGeneration) {
+        setState(() => availabilityError = _errorMessage(exception));
+      }
+    } finally {
+      if (mounted && current == availabilityGeneration) {
+        setState(() => loadingAvailability = false);
+      }
+    }
+  }
 
   @override
   void initState() {
@@ -18583,7 +18785,10 @@ class _WorkflowPageState extends State<WorkflowPage> {
     } catch (exception) {
       error = exception.toString().replaceFirst('Exception: ', '');
     }
-    if (mounted) setState(() => loadingReferences = false);
+    if (mounted) {
+      await _loadBookingAvailability();
+      if (mounted) setState(() => loadingReferences = false);
+    }
   }
 
   Future<void> _loadReference(WorkflowField field) async {
@@ -18630,7 +18835,15 @@ class _WorkflowPageState extends State<WorkflowPage> {
       }).toList();
     }
     references[field.name] = rows
-        .map((row) => Map<String, dynamic>.from(row))
+        .map(
+          (row) => <String, dynamic>{
+            ...Map<String, dynamic>.from(row),
+            if (field.name == 'sessionSlotId')
+              'timezone': availabilityTimezone.isEmpty
+                  ? 'Asia/Riyadh'
+                  : availabilityTimezone,
+          },
+        )
         .toList();
     if (controllers[field.name]?.text.isEmpty == true && rows.length == 1) {
       controllers[field.name]?.text = _referenceId(rows.first);
@@ -18656,6 +18869,17 @@ class _WorkflowPageState extends State<WorkflowPage> {
 
   Future<void> submit() async {
     if (formKey.currentState?.validate() != true) return;
+    if (isReservation &&
+        controllers['resourceType']?.text == 'COURT' &&
+        (loadingAvailability ||
+            availabilityError != null ||
+            bookingAvailability.isEmpty)) {
+      setState(
+        () =>
+            error = 'لا يمكن تأكيد الحجز قبل تحميل فترات الإتاحة لهذا المورد.',
+      );
+      return;
+    }
     final values = controllers.map(
       (key, value) => MapEntry(key, value.text.trim()),
     );
@@ -19356,6 +19580,15 @@ class _WorkflowPageState extends State<WorkflowPage> {
             ),
             const SizedBox(height: 16),
           ],
+          if (isReservation &&
+              (controllers['resourceId']?.text.isNotEmpty ?? false))
+            BookingAvailabilityCard(
+              rules: bookingAvailability,
+              loading: loadingAvailability,
+              error: availabilityError,
+              timezone: availabilityTimezone,
+              onRetry: _loadBookingAvailability,
+            ),
           if (loadingReferences)
             const LinearProgressIndicator()
           else
@@ -19406,7 +19639,9 @@ class _WorkflowPageState extends State<WorkflowPage> {
             ),
           const SizedBox(height: 8),
           FilledButton.icon(
-            onPressed: saving || loadingReferences ? null : submit,
+            onPressed: saving || loadingReferences || loadingAvailability
+                ? null
+                : submit,
             icon: saving
                 ? const SizedBox.square(
                     dimension: 18,
@@ -19484,7 +19719,13 @@ class _WorkflowPageState extends State<WorkflowPage> {
                 ? field.name == 'sessionSlotId'
                       ? 'لا توجد مواعيد مفتوحة خلال الثلاثين يومًا القادمة.'
                       : 'لا توجد عناصر متاحة في السياق الحالي.'
+                : field.name == 'sessionSlotId' && controller.text.isNotEmpty
+                ? rows
+                      .where((row) => _referenceId(row) == controller.text)
+                      .map((row) => _referenceLabel(row, field))
+                      .firstOrNull
                 : null,
+            helperMaxLines: 3,
           ),
           items: rows
               .map(
@@ -19505,6 +19746,7 @@ class _WorkflowPageState extends State<WorkflowPage> {
             if (selected != null) {
               _copyReferenceValues(field, selected);
             }
+            if (field.name == 'resourceId') await _loadBookingAvailability();
             for (final dependent in widget.workflow.fields.where(
               (item) => item.referencePath?.contains('{${field.name}}') == true,
             )) {
@@ -19642,7 +19884,7 @@ String _referenceId(Map row) =>
 String _referenceLabel(Map<String, dynamic> row, WorkflowField field) {
   if (field.name == 'sessionSlotId' && row['startsAt'] != null) {
     final available = row['availableCount'] ?? row['remainingCapacity'];
-    return '${_displayValue('startsAt', row['startsAt'])}${available != null ? ' • متاح $available' : ''}';
+    return '${bookingSlotPeriodLabel(row, zone: row['timezone']?.toString() ?? 'Asia/Riyadh')}${available != null ? ' • متاح $available' : ''}';
   }
   String first(List<String> keys) => keys
       .map((key) => row[key]?.toString() ?? '')
