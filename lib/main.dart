@@ -7771,7 +7771,7 @@ class _MemberNotificationButton extends StatelessWidget {
       child: IconButton(
         onPressed: () => Navigator.of(context).push(
           MaterialPageRoute<void>(
-            builder: (_) => MessagesPage(controller: controller),
+            builder: (_) => _MemberMessagesPage(controller: controller),
           ),
         ),
         icon: const Icon(Icons.notifications_none_rounded),
@@ -7779,6 +7779,35 @@ class _MemberNotificationButton extends StatelessWidget {
       ),
     );
   }
+}
+
+class _MemberMessagesPage extends StatelessWidget {
+  const _MemberMessagesPage({required this.controller});
+  final GoController controller;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: const Text(
+        'الرسائل والإشعارات',
+        style: TextStyle(fontWeight: FontWeight.w900),
+      ),
+      actions: [
+        IconButton(
+          onPressed: controller.refreshing
+              ? null
+              : () => unawaited(controller.refresh(announce: true)),
+          icon: const Icon(Icons.refresh_rounded),
+          tooltip: 'تحديث الإشعارات',
+        ),
+        const SizedBox(width: 6),
+      ],
+    ),
+    body: SafeArea(
+      top: false,
+      child: MessagesPage(controller: controller, showHeading: false),
+    ),
+  );
 }
 
 class MemberHomePage extends StatelessWidget {
@@ -7956,7 +7985,7 @@ class MemberMorePage extends StatelessWidget {
               ListTile(
                 onTap: () => Navigator.of(context).push(
                   MaterialPageRoute<void>(
-                    builder: (_) => MessagesPage(controller: controller),
+                    builder: (_) => _MemberMessagesPage(controller: controller),
                   ),
                 ),
                 leading: const Icon(Icons.notifications_none_rounded),
@@ -10557,17 +10586,24 @@ class _OperationScheduleRow extends StatelessWidget {
 }
 
 class MessagesPage extends StatelessWidget {
-  const MessagesPage({super.key, required this.controller});
+  const MessagesPage({
+    super.key,
+    required this.controller,
+    this.showHeading = true,
+  });
   final GoController controller;
+  final bool showHeading;
   @override
   Widget build(BuildContext context) {
     final unread = controller.notices.where((n) => n['unread'] == true).length;
     return PageFrame(
       onRefresh: () => controller.refresh(announce: true),
-      title: 'الرسائل والإشعارات',
-      subtitle: unread == 0
-          ? 'لا توجد رسائل جديدة.'
-          : 'لديك $unread رسائل تحتاج مراجعة.',
+      title: showHeading ? 'الرسائل والإشعارات' : null,
+      subtitle: showHeading
+          ? unread == 0
+                ? 'لا توجد رسائل جديدة.'
+                : 'لديك $unread رسائل تحتاج مراجعة.'
+          : null,
       child: Column(
         children: [
           if (unread > 0)

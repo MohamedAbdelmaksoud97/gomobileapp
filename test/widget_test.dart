@@ -412,6 +412,44 @@ void main() {
     controller.dispose();
   });
 
+  testWidgets(
+    'member notifications stay readable on a compact Android-sized viewport',
+    (tester) async {
+      tester.view.physicalSize = const Size(375, 667);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final controller = GoController(ApiClient(baseUrl: ''))
+        ..staffMode = false
+        ..notices = [];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          locale: const Locale('ar'),
+          home: Directionality(
+            textDirection: TextDirection.rtl,
+            child: MemberShell(controller: controller),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('الإشعارات'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('الرسائل والإشعارات'), findsOneWidget);
+      expect(find.text('كل شيء هادئ الآن'), findsOneWidget);
+      expect(find.textContaining('تنبيهات الحساب'), findsOneWidget);
+      final inheritedStyle = DefaultTextStyle.of(
+        tester.element(find.text('كل شيء هادئ الآن')),
+      ).style;
+      expect(inheritedStyle.fontSize, isNot(48));
+      expect(inheritedStyle.color, isNot(const Color(0xD0FF0000)));
+      expect(inheritedStyle.decoration, isNot(TextDecoration.underline));
+      expect(tester.takeException(), isNull);
+      controller.dispose();
+    },
+  );
+
   testWidgets('staff navigation mirrors the cohesive web sections', (
     tester,
   ) async {
