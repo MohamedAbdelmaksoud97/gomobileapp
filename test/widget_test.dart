@@ -1,8 +1,69 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:gomobileapp/main.dart';
 
+class _RecordingApiClient extends ApiClient {
+  _RecordingApiClient() : super(baseUrl: '');
+
+  final calls = <Map<String, dynamic>>[];
+
+  @override
+  Future<dynamic> request(
+    String path, {
+    String method = 'GET',
+    Map<String, dynamic>? body,
+    Map<String, String>? query,
+    Map<String, String>? extraHeaders,
+    bool retryAuthentication = true,
+  }) async {
+    calls.add({
+      'path': path,
+      'method': method,
+      'body': body,
+      'query': query == null ? null : Map<String, String>.from(query),
+    });
+    if (path.endsWith('/members')) {
+      return [
+        {'id': 'member-1', 'name': 'عضو تجريبي'},
+      ];
+    }
+    if (path.endsWith('/bookable-resources')) {
+      final memberPath = path.startsWith('/self/');
+      return [
+        {
+          'id': 'resource-1',
+          'name': 'حصة تجريبية',
+          'type': 'CLASS',
+          'resourceType': 'CLASS',
+          'serviceId': 'service-1',
+          if (memberPath) 'facilityName': 'القاعة الرئيسية',
+        },
+      ];
+    }
+    if (path.endsWith('/session-slots')) {
+      final start = DateTime.now().toUtc().add(const Duration(days: 2));
+      return [
+        {
+          'id': 'slot-1',
+          'startsAt': start.toIso8601String(),
+          'endsAt': start.add(const Duration(hours: 1)).toIso8601String(),
+          'capacity': 10,
+          'bookedCount': 0,
+        },
+      ];
+    }
+    if (path.endsWith('/quotes')) return {'grossMinor': '12500'};
+    if (path.endsWith('/orders')) {
+      return {'id': 'order-1', 'invoiceId': 'invoice-1'};
+    }
+    return null;
+  }
+}
+
 void main() {
+  setUp(() => FlutterSecureStorage.setMockInitialValues({}));
+
   test('production API is the default runtime target', () {
     expect(ApiClient().baseUrl, productionApiBaseUrl);
   });
@@ -44,6 +105,12 @@ void main() {
     );
     expect(attendance.keys, containsAll(<String>['branchId', 'from', 'to']));
     expect(attendance, isNot(contains('limit')));
+    final selfSlots = resourceQueryFor(
+      '/self/organizations/{organizationId}/bookable-resources/resource-id/session-slots',
+      'branch-id',
+    );
+    expect(selfSlots, containsPair('branchId', 'branch-id'));
+    expect(selfSlots.keys, containsAll(<String>['from', 'to']));
   });
 
   test('mobile workflows cover high-value web mutations', () {
@@ -130,12 +197,128 @@ void main() {
     );
   });
 
+  test(
+    'dark mode preference is restored and persisted on the device',
+    () async {
+      FlutterSecureStorage.setMockInitialValues({'go_theme_mode': 'dark'});
+      final controller = GoController(ApiClient(baseUrl: ''));
+      await controller.initialize();
+      expect(controller.darkMode, isTrue);
+
+      controller.setDarkMode(false);
+      await Future<void>.delayed(Duration.zero);
+      final restored = GoController(ApiClient(baseUrl: ''));
+      await restored.initialize();
+      expect(restored.darkMode, isFalse);
+      controller.dispose();
+      restored.dispose();
+    },
+  );
+
+  testWidgets(
+    'staff booking auto-selects its linked data and creates an invoice',
+    (tester) async {
+      final api = _RecordingApiClient();
+      final controller = GoController(api)
+        ..organizationId = 'organization-1'
+        ..branchId = 'branch-1';
+      final workflow = mobileWorkflows.firstWhere(
+        (item) => item.operationId == 'createManualReservation',
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Directionality(
+            textDirection: TextDirection.rtl,
+            child: WorkflowPage(controller: controller, workflow: workflow),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.text('متابعة إنشاء الحجز'),
+        450,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.text('متابعة إنشاء الحجز'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('فاتورة بقيمة'), findsOneWidget);
+      await tester.tap(find.text('تأكيد'));
+      await tester.pumpAndSettle();
+
+      final order = api.calls.lastWhere(
+        (call) => call['path'] == '/organizations/organization-1/orders',
+      );
+      final orderBody = order['body'] as Map<String, dynamic>;
+      final line = (orderBody['lines'] as List).single as Map<String, dynamic>;
+      final booking = line['booking'] as Map<String, dynamic>;
+      expect(line['targetId'], 'service-1');
+      expect(booking['resourceId'], 'resource-1');
+      expect(booking['sessionSlotId'], 'slot-1');
+      expect(
+        api.calls.any((call) => call['path'].toString().endsWith('/quotes')),
+        isTrue,
+      );
+      controller.dispose();
+    },
+  );
+
+  testWidgets('member booking uses strict self queries and reaches checkout', (
+    tester,
+  ) async {
+    final api = _RecordingApiClient();
+    final controller = GoController(api)
+      ..staffMode = false
+      ..organizationId = 'organization-1'
+      ..branchId = 'branch-1'
+      ..selfMembers = [
+        {'memberId': 'member-1', 'memberName': 'عضو تجريبي'},
+      ];
+    final workflow = mobileWorkflows.firstWhere(
+      (item) => item.operationId == 'checkoutSelfBooking',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Directionality(
+          textDirection: TextDirection.rtl,
+          child: WorkflowPage(controller: controller, workflow: workflow),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final resourcesCall = api.calls.firstWhere(
+      (call) => call['path'].toString().endsWith('/bookable-resources'),
+    );
+    expect(resourcesCall['query'], {'branchId': 'branch-1'});
+    final slotsCall = api.calls.firstWhere(
+      (call) => call['path'].toString().endsWith('/session-slots'),
+    );
+    expect(slotsCall['query'], containsPair('branchId', 'branch-1'));
+    await tester.tap(find.text('تأكيد الحجز'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('تأكيد'));
+    await tester.pumpAndSettle();
+
+    final order = api.calls.lastWhere(
+      (call) => call['path'].toString().endsWith('/orders'),
+    );
+    final body = order['body'] as Map<String, dynamic>;
+    final line = (body['lines'] as List).single as Map<String, dynamic>;
+    final booking = line['booking'] as Map<String, dynamic>;
+    expect(line['targetId'], 'service-1');
+    expect(booking['sessionSlotId'], 'slot-1');
+    controller.dispose();
+  });
+
   testWidgets('GO login experience renders', (tester) async {
     tester.view.physicalSize = const Size(400, 850);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
     await tester.pumpWidget(GoMobileApp(apiClient: ApiClient(baseUrl: '')));
+    await tester.pumpAndSettle();
     final app = tester.widget<MaterialApp>(find.byType(MaterialApp));
     expect(app.theme?.colorScheme.primary, goYellow);
     expect(app.theme?.colorScheme.onPrimary, goInk);
@@ -256,6 +439,7 @@ void main() {
     expect(find.text('الإدارة', skipOffstage: false), findsOneWidget);
     expect(find.text('البوابات والبصمة', skipOffstage: false), findsOneWidget);
     expect(find.text('مساحة عملي', skipOffstage: false), findsOneWidget);
+    expect(find.text('الوضع الداكن', skipOffstage: false), findsOneWidget);
     expect(find.text('العمليات المتقدمة', skipOffstage: false), findsNothing);
     expect(find.text('الإجراءات الأساسية', skipOffstage: false), findsNothing);
     expect(tester.takeException(), isNull);

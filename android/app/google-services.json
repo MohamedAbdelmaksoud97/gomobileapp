@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "74658758347",
+    "project_id": "go-fitness-9ca64",
+    "storage_bucket": "go-fitness-9ca64.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:74658758347:android:71c5676703187445ca654e",
+        "android_client_info": {
+          "package_name": "com.gofitness.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA9W6FCZXdqlj6yikQogthc6OZ3rzyinlk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -97,6 +97,37 @@ String apiProblemMessage(String? code, String fallback) {
     'daily_menu_already_exists' => 'توجد قائمة لهذا اليوم بالفعل. افتح القائمة الحالية وعدّلها بدل إنشاء قائمة جديدة.',
     'version_conflict' =>
       'تم تحديث السجل من جهاز آخر. حدّث البيانات ثم أعد المحاولة.',
+    'session_slot_capacity_exhausted' =>
+      'اكتملت سعة الموعد أثناء الحجز. حدّث المواعيد واختر موعدًا آخر.',
+    'booking_overlap' =>
+      'المورد محجوز بالفعل خلال جزء من الفترة المختارة. اختر وقتًا آخر.',
+    'booking_crosses_business_date' =>
+      'يجب أن يبدأ الحجز وينتهي في اليوم نفسه ولا يعبر منتصف الليل.',
+    'booking_outside_availability' => 'الوقت المختار خارج ساعات إتاحة المورد. راجع جدول الإتاحة واختر فترة متاحة.',
+    'booking_blackout' =>
+      'المورد مغلق أو تحت الصيانة خلال الفترة المختارة. اختر موعدًا آخر.',
+    'booking_start_not_future' => 'يجب أن يكون موعد الحجز في المستقبل.',
+    'invalid_booking_period' =>
+      'فترة الحجز غير صحيحة. اجعل وقت النهاية بعد البداية وفي اليوم نفسه.',
+    'booking_resource_mismatch' =>
+      'تغيرت بيانات المورد أو الخدمة. أعد اختيار المورد من القائمة المحدثة.',
+    'booking_service_unavailable' =>
+      'الخدمة المرتبطة بالمورد غير متاحة في هذا الفرع حاليًا.',
+    'booking_service_not_active' =>
+      'الخدمة المرتبطة بالمورد غير نشطة. اختر موردًا آخر أو فعّل الخدمة.',
+    'bookable_resource_not_found' =>
+      'مورد الحجز لم يعد متاحًا. حدّث القائمة واختر موردًا آخر.',
+    'bookable_resource_not_active' =>
+      'مورد الحجز متوقف أو تحت الصيانة ولا يقبل حجوزات جديدة.',
+    'session_slot_required' || 'session_slot_reference_required' =>
+      'اختر موعدًا منشورًا ومتاحًا قبل تأكيد الحجز.',
+    'session_slot_not_found' || 'session_slot_not_open' =>
+      'الموعد المختار لم يعد متاحًا. حدّث القائمة واختر موعدًا آخر.',
+    'session_slot_type_mismatch' =>
+      'الموعد لا يطابق نوع المورد. أعد اختيار المورد والموعد.',
+    'booking_quote_mismatch' =>
+      'تغير سعر الخدمة أو بيانات الحجز. أعد اختيار المورد ثم حاول مجددًا.',
+    'manual_booking_sale_forbidden' => 'الحجز التشغيلي بلا مقابل لا يصدر فاتورة. اختر الحجز المفوتر للخدمات المدفوعة.',
     _ => fallback,
   };
 }
@@ -1580,8 +1611,8 @@ final mobileWorkflows = <MobileWorkflow>[
   MobileWorkflow(
     operationId: 'createManualReservation',
     title: 'حجز جديد',
-    description: 'اختر العميل والمورد والموعد. يطابق التطبيق نوع المورد وخدمته تلقائيًا قبل الإرسال.',
-    submitLabel: 'إنشاء الحجز',
+    description: 'اختر العميل والمورد وطريقة التأكيد؛ يمكنك إصدار فاتورة وتحصيلها من نقطة البيع أو تسجيل حجز تشغيلي بلا مقابل.',
+    submitLabel: 'متابعة إنشاء الحجز',
     successMessage: 'تم إنشاء الحجز بنجاح.',
     method: 'POST',
     path: '/organizations/{organizationId}/reservations',
@@ -1632,6 +1663,17 @@ final mobileWorkflows = <MobileWorkflow>[
         visibleWhenValues: ['VISITOR'],
       ),
       WorkflowField(
+        name: 'billingMode',
+        label: 'طريقة تأكيد الحجز',
+        type: WorkflowFieldType.select,
+        required: true,
+        initialValue: 'INVOICE',
+        choices: [
+          WorkflowChoice('INVOICE', 'إصدار فاتورة وتحصيل قيمة الحجز'),
+          WorkflowChoice('OPERATIONAL', 'حجز تشغيلي بلا مقابل'),
+        ],
+      ),
+      WorkflowField(
         name: 'resourceId',
         label: 'الحصة أو المرفق',
         type: WorkflowFieldType.reference,
@@ -1669,6 +1711,8 @@ final mobileWorkflows = <MobileWorkflow>[
         label: 'بداية حجز الملعب',
         type: WorkflowFieldType.dateTime,
         required: true,
+        initialValue: _nextBookingDateTime(),
+        autoFillDate: false,
         visibleWhenField: 'resourceType',
         visibleWhenValues: ['COURT'],
       ),
@@ -1677,6 +1721,8 @@ final mobileWorkflows = <MobileWorkflow>[
         label: 'نهاية حجز الملعب',
         type: WorkflowFieldType.dateTime,
         required: true,
+        initialValue: _nextBookingDateTime(additionalHours: 1),
+        autoFillDate: false,
         visibleWhenField: 'resourceType',
         visibleWhenValues: ['COURT'],
       ),
@@ -1686,6 +1732,8 @@ final mobileWorkflows = <MobileWorkflow>[
         type: WorkflowFieldType.number,
         required: true,
         initialValue: '1',
+        visibleWhenField: 'resourceType',
+        visibleWhenValues: ['CLASS'],
       ),
       WorkflowField(
         name: 'participantCount',
@@ -1693,6 +1741,8 @@ final mobileWorkflows = <MobileWorkflow>[
         type: WorkflowFieldType.number,
         required: true,
         initialValue: '1',
+        visibleWhenField: 'resourceType',
+        visibleWhenValues: ['COURT'],
       ),
     ],
     body: (values, controller) {
@@ -2633,12 +2683,16 @@ final mobileWorkflows = <MobileWorkflow>[
         label: 'بداية الحجب',
         type: WorkflowFieldType.dateTime,
         required: true,
+        initialValue: _nextBookingDateTime(),
+        autoFillDate: false,
       ),
       WorkflowField(
         name: 'endsAt',
         label: 'نهاية الحجب',
         type: WorkflowFieldType.dateTime,
         required: true,
+        initialValue: _nextBookingDateTime(additionalHours: 1),
+        autoFillDate: false,
       ),
       WorkflowField(
         name: 'reason',
@@ -3892,6 +3946,8 @@ final mobileWorkflows = <MobileWorkflow>[
         label: 'بداية حجز الملعب',
         type: WorkflowFieldType.dateTime,
         required: true,
+        initialValue: _nextBookingDateTime(),
+        autoFillDate: false,
         visibleWhenField: 'resourceType',
         visibleWhenValues: ['COURT'],
       ),
@@ -3900,6 +3956,8 @@ final mobileWorkflows = <MobileWorkflow>[
         label: 'نهاية حجز الملعب',
         type: WorkflowFieldType.dateTime,
         required: true,
+        initialValue: _nextBookingDateTime(additionalHours: 1),
+        autoFillDate: false,
         visibleWhenField: 'resourceType',
         visibleWhenValues: ['COURT'],
       ),
@@ -3909,6 +3967,8 @@ final mobileWorkflows = <MobileWorkflow>[
         type: WorkflowFieldType.number,
         required: true,
         initialValue: '1',
+        visibleWhenField: 'resourceType',
+        visibleWhenValues: ['COURT'],
       ),
     ],
     body: (values, controller) {
@@ -6104,8 +6164,10 @@ class GoController extends ChangeNotifier {
   ];
 
   Timer? _notificationTimer;
+  static const _themePreferenceKey = 'go_theme_mode';
 
   Future<void> initialize() async {
+    await _loadThemePreference();
     if (!api.configured) {
       bootstrapping = false;
       notifyListeners();
@@ -6431,8 +6493,29 @@ class GoController extends ChangeNotifier {
   }
 
   void toggleTheme() {
-    darkMode = !darkMode;
+    setDarkMode(!darkMode);
+  }
+
+  void setDarkMode(bool value) {
+    if (darkMode == value) return;
+    darkMode = value;
     notifyListeners();
+    unawaited(_saveThemePreference());
+  }
+
+  Future<void> _loadThemePreference() async {
+    try {
+      darkMode = await api.secure.read(key: _themePreferenceKey) == 'dark';
+    } catch (_) {}
+  }
+
+  Future<void> _saveThemePreference() async {
+    try {
+      await api.secure.write(
+        key: _themePreferenceKey,
+        value: darkMode ? 'dark' : 'light',
+      );
+    } catch (_) {}
   }
 
   @override
@@ -14582,6 +14665,21 @@ class MorePage extends StatelessWidget {
           Card(
             child: Column(
               children: [
+                SwitchListTile.adaptive(
+                  secondary: Icon(
+                    controller.darkMode
+                        ? Icons.dark_mode_rounded
+                        : Icons.light_mode_rounded,
+                  ),
+                  title: const Text(
+                    'الوضع الداكن',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: const Text('تبديل مظهر التطبيق وحفظه على الجهاز'),
+                  value: controller.darkMode,
+                  onChanged: controller.setDarkMode,
+                ),
+                if (controller.branches.isNotEmpty) const Divider(height: 1),
                 if (controller.branches.isNotEmpty) ...[
                   ListTile(
                     onTap: () => _openContextSheet(context, controller),
@@ -17256,6 +17354,26 @@ class _AccountPageState extends State<AccountPage> {
             padding: const EdgeInsets.all(18),
             children: [
               Card(
+                child: SwitchListTile.adaptive(
+                  secondary: Icon(
+                    widget.controller.darkMode
+                        ? Icons.dark_mode_rounded
+                        : Icons.light_mode_rounded,
+                  ),
+                  title: const Text(
+                    'الوضع الداكن',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                  subtitle: const Text('يُحفظ اختيارك تلقائيًا على هذا الجهاز'),
+                  value: widget.controller.darkMode,
+                  onChanged: (value) {
+                    widget.controller.setDarkMode(value);
+                    setState(() {});
+                  },
+                ),
+              ),
+              const SizedBox(height: 14),
+              Card(
                 child: Padding(
                   padding: const EdgeInsets.all(18),
                   child: Column(
@@ -18040,6 +18158,10 @@ class _WorkflowPageState extends State<WorkflowPage> {
       }
       controllers[field.name] = TextEditingController(text: initial);
     }
+    if (widget.workflow.operationId == 'createManualReservation' &&
+        !widget.controller.can('sales.checkout')) {
+      controllers['billingMode']?.text = 'OPERATIONAL';
+    }
     unawaited(_loadReferences());
   }
 
@@ -18091,19 +18213,16 @@ class _WorkflowPageState extends State<WorkflowPage> {
       references[field.name] = [];
       return;
     }
-    final query = <String, String>{
-      'branchId': widget.controller.branchId,
-      'limit': '100',
-    };
+    final query = resourceQueryFor(path, widget.controller.branchId);
     if (path.endsWith('/session-slots')) {
       query
         ..remove('limit')
-        ..remove('branchId')
         ..['from'] = DateTime.now().toUtc().toIso8601String()
         ..['to'] = DateTime.now()
             .add(const Duration(days: 30))
             .toUtc()
             .toIso8601String();
+      if (!path.startsWith('/self/')) query.remove('branchId');
     }
     final data = await widget.controller.api.request(path, query: query);
     var rows = data is List
@@ -18120,6 +18239,23 @@ class _WorkflowPageState extends State<WorkflowPage> {
         .toList();
     if (controllers[field.name]?.text.isEmpty == true && rows.length == 1) {
       controllers[field.name]?.text = _referenceId(rows.first);
+      _copyReferenceValues(field, Map<String, dynamic>.from(rows.first));
+    }
+  }
+
+  void _copyReferenceValues(
+    WorkflowField field,
+    Map<String, dynamic> selected,
+  ) {
+    for (final binding in field.copyValues.entries) {
+      final copied =
+          selected[binding.value] ??
+          (binding.value == 'resourceType'
+              ? selected['type']
+              : binding.value == 'type'
+              ? selected['resourceType']
+              : null);
+      controllers[binding.key]?.text = copied?.toString() ?? '';
     }
   }
 
@@ -18170,11 +18306,64 @@ class _WorkflowPageState extends State<WorkflowPage> {
         return;
       }
     }
-    if (widget.workflow.operationId == 'createManualReservation' &&
+    final isBookingWorkflow = const {
+      'createManualReservation',
+      'checkoutSelfBooking',
+    }.contains(widget.workflow.operationId);
+    if (isBookingWorkflow &&
         ((values['serviceId'] ?? '').isEmpty ||
             (values['resourceType'] ?? '').isEmpty)) {
       setState(() => error = 'بيانات المورد غير مكتملة؛ أعد اختيار المورد.');
       return;
+    }
+    if (isBookingWorkflow) {
+      final type = values['resourceType'];
+      if (type != 'COURT' && (values['sessionSlotId'] ?? '').isEmpty) {
+        setState(() => error = 'اختر موعدًا متاحًا قبل تأكيد الحجز.');
+        return;
+      }
+      if (type == 'CLASS' &&
+          widget.workflow.operationId == 'createManualReservation') {
+        final seats = int.tryParse(values['seats'] ?? '');
+        if (seats == null || seats < 1) {
+          setState(() => error = 'أدخل عدد مقاعد صحيحًا لا يقل عن مقعد واحد.');
+          return;
+        }
+      }
+      if (type == 'COURT') {
+        final participants = int.tryParse(values['participantCount'] ?? '');
+        final startText = values['startsAt'] ?? '';
+        final endText = values['endsAt'] ?? '';
+        final start = DateTime.tryParse(startText);
+        final end = DateTime.tryParse(endText);
+        if (participants == null || participants < 1 || participants > 100) {
+          setState(() => error = 'أدخل عدد مشاركين صحيحًا من 1 إلى 100.');
+          return;
+        }
+        if (start == null || end == null || !end.isAfter(start)) {
+          setState(
+            () => error = 'وقت نهاية الحجز يجب أن يكون بعد وقت البداية.',
+          );
+          return;
+        }
+        if (!start.isAfter(DateTime.now())) {
+          setState(() => error = 'اختر موعد حجز في المستقبل.');
+          return;
+        }
+        if (startText.substring(0, 10) != endText.substring(0, 10)) {
+          setState(() => error = 'يجب أن يبدأ الحجز وينتهي في اليوم نفسه.');
+          return;
+        }
+      }
+      if (widget.workflow.operationId == 'createManualReservation' &&
+          values['billingMode'] == 'INVOICE' &&
+          !widget.controller.can('sales.checkout')) {
+        setState(
+          () => error =
+              'لا تملك صلاحية إصدار فاتورة. اختر حجزًا تشغيليًا بلا مقابل.',
+        );
+        return;
+      }
     }
     if (widget.workflow.operationId == 'recordSplitPayment' &&
         values['firstMethod'] == values['secondMethod']) {
@@ -18301,13 +18490,67 @@ class _WorkflowPageState extends State<WorkflowPage> {
         if (mounted) setState(() => saving = false);
       }
     }
+    Map<String, dynamic>? bookingQuote;
+    if (widget.workflow.operationId == 'createManualReservation') {
+      setState(() {
+        saving = true;
+        error = null;
+      });
+      try {
+        if (values['resourceType'] == 'COURT') {
+          final availability = await widget.controller.api.request(
+            '/organizations/${widget.controller.organizationId}/bookable-resources/${values['resourceId']}/availability-rules',
+          );
+          final rules = availability is List
+              ? availability
+              : availability is Map && availability['items'] is List
+              ? availability['items'] as List
+              : const <dynamic>[];
+          if (rules.isEmpty) {
+            setState(
+              () => error = 'هذا المورد غير جاهز للحجز؛ أضف أيام وساعات الإتاحة أولًا من إعداد النظام.',
+            );
+            return;
+          }
+        }
+        if (values['billingMode'] == 'INVOICE') {
+          final quantity = values['resourceType'] == 'CLASS'
+              ? int.tryParse(values['seats'] ?? '') ?? 1
+              : 1;
+          final quote = await widget.controller.api.request(
+            '/organizations/${widget.controller.organizationId}/quotes',
+            method: 'POST',
+            body: {
+              'branchId': widget.controller.branchId,
+              'targetType': 'SERVICE',
+              'targetId': values['serviceId'],
+              'quantity': quantity,
+              if (values['customerType'] == 'MEMBER')
+                'memberId': values['memberId'],
+            },
+          );
+          bookingQuote = quote is Map
+              ? Map<String, dynamic>.from(quote)
+              : <String, dynamic>{};
+        }
+      } catch (exception) {
+        setState(() => error = _errorMessage(exception));
+        return;
+      } finally {
+        if (mounted) setState(() => saving = false);
+      }
+    }
     if (!mounted) return;
     final accepted = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text(widget.workflow.title),
         content: audiencePreview == null
-            ? const Text('راجع البيانات قبل إرسالها إلى نظام الإنتاج.')
+            ? Text(
+                bookingQuote == null
+                    ? 'راجع البيانات قبل إرسالها إلى نظام الإنتاج.'
+                    : 'سيُنشأ الحجز مع فاتورة بقيمة ${_money(bookingQuote['grossMinor'] ?? 0)}، ويظل بانتظار التحصيل حتى يتم الدفع.',
+              )
             : Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -18345,11 +18588,54 @@ class _WorkflowPageState extends State<WorkflowPage> {
       error = null;
     });
     try {
-      final path = _resolve(widget.workflow.path);
+      var path = _resolve(widget.workflow.path);
+      var body = widget.workflow.body(values, widget.controller);
+      if (widget.workflow.operationId == 'createManualReservation' &&
+          values['billingMode'] == 'INVOICE') {
+        final type = values['resourceType'];
+        final quantity = type == 'CLASS'
+            ? int.tryParse(values['seats'] ?? '') ?? 1
+            : 1;
+        path = '/organizations/${widget.controller.organizationId}/orders';
+        body = {
+          'sellingBranchId': widget.controller.branchId,
+          if (values['customerType'] == 'MEMBER')
+            'memberId': values['memberId'],
+          'lines': [
+            {
+              'type': 'BOOKING',
+              'targetId': values['serviceId'],
+              'quantity': quantity,
+              'booking': {
+                'resourceId': values['resourceId'],
+                'type': type,
+                'seats': quantity,
+                'participantCount': type == 'COURT'
+                    ? int.tryParse(values['participantCount'] ?? '') ?? 1
+                    : quantity,
+                if (values['customerType'] == 'VISITOR') ...{
+                  'guestName': values['guestName'],
+                  'guestPhoneE164': values['guestPhoneE164']?.replaceAll(
+                    RegExp(r'[\s()-]'),
+                    '',
+                  ),
+                  if (values['guestEmail']?.isNotEmpty == true)
+                    'guestEmail': values['guestEmail']?.toLowerCase(),
+                },
+                if (type == 'COURT') ...{
+                  'startsAt': _asIso(values['startsAt']),
+                  'endsAt': _asIso(values['endsAt']),
+                } else
+                  'sessionSlotId': values['sessionSlotId'],
+              },
+            },
+          ],
+        };
+      }
       final result = await widget.controller.api.request(
         path,
         method: widget.workflow.method,
-        body: widget.workflow.body(values, widget.controller),
+        body: body,
       );
       if ((widget.workflow.operationId == 'registerAccessDevice' ||
               widget.workflow.operationId.startsWith(
@@ -18601,6 +18887,42 @@ class _WorkflowPageState extends State<WorkflowPage> {
             const LinearProgressIndicator()
           else
             ...widget.workflow.fields.where(_isVisible).map(_buildField),
+          if (!loadingReferences &&
+              widget.workflow.operationId == 'createManualReservation')
+            Container(
+              margin: const EdgeInsets.only(bottom: 14),
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: controllers['billingMode']?.text == 'INVOICE'
+                    ? Colors.blue.withValues(alpha: .08)
+                    : Colors.orange.withValues(alpha: .09),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: controllers['billingMode']?.text == 'INVOICE'
+                      ? Colors.blue.withValues(alpha: .25)
+                      : Colors.orange.withValues(alpha: .3),
+                ),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    controllers['billingMode']?.text == 'INVOICE'
+                        ? Icons.receipt_long_outlined
+                        : Icons.info_outline_rounded,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      controllers['billingMode']?.text == 'INVOICE'
+                          ? 'سيتم التحقق من سعر الخدمة وإنشاء فاتورة. يبقى الحجز بانتظار التحصيل حتى يتم الدفع.'
+                          : 'حجز تشغيلي بلا مقابل: سيُؤكد مباشرة ولن تظهر له فاتورة أو مبلغ للتحصيل.',
+                      style: const TextStyle(fontSize: 12, height: 1.55),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           if (error != null)
             Padding(
               padding: const EdgeInsets.only(top: 4, bottom: 12),
@@ -18648,12 +18970,18 @@ class _WorkflowPageState extends State<WorkflowPage> {
       );
     }
     if (field.type == WorkflowFieldType.select) {
+      final choices =
+          widget.workflow.operationId == 'createManualReservation' &&
+              field.name == 'billingMode' &&
+              !widget.controller.can('sales.checkout')
+          ? field.choices.where((choice) => choice.value != 'INVOICE').toList()
+          : field.choices;
       return Padding(
         padding: const EdgeInsets.only(bottom: 12),
         child: DropdownButtonFormField<String>(
           initialValue: controller.text.isEmpty ? null : controller.text,
           decoration: InputDecoration(labelText: field.label),
-          items: field.choices
+          items: choices
               .map(
                 (choice) => DropdownMenuItem(
                   value: choice.value,
@@ -18680,7 +19008,9 @@ class _WorkflowPageState extends State<WorkflowPage> {
           decoration: InputDecoration(
             labelText: field.label,
             helperText: rows.isEmpty
-                ? 'لا توجد عناصر متاحة في السياق الحالي.'
+                ? field.name == 'sessionSlotId'
+                      ? 'لا توجد مواعيد مفتوحة خلال الثلاثين يومًا القادمة.'
+                      : 'لا توجد عناصر متاحة في السياق الحالي.'
                 : null,
           ),
           items: rows
@@ -18700,12 +19030,7 @@ class _WorkflowPageState extends State<WorkflowPage> {
                 .where((row) => _referenceId(row) == value)
                 .firstOrNull;
             if (selected != null) {
-              for (final binding in field.copyValues.entries) {
-                final copied =
-                    selected[binding.value] ??
-                    (binding.value == 'resourceType' ? selected['type'] : null);
-                controllers[binding.key]?.text = copied?.toString() ?? '';
-              }
+              _copyReferenceValues(field, selected);
             }
             for (final dependent in widget.workflow.fields.where(
               (item) => item.referencePath?.contains('{${field.name}}') == true,
@@ -18820,6 +19145,17 @@ class _WorkflowPageState extends State<WorkflowPage> {
 
 String _localDateTimeValue(DateTime value) =>
     '${value.year.toString().padLeft(4, '0')}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')}T${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
+
+String _nextBookingDateTime({int additionalHours = 0}) {
+  final now = DateTime.now();
+  final nextHour = DateTime(
+    now.year,
+    now.month,
+    now.day,
+    now.hour,
+  ).add(Duration(hours: 1 + additionalHours));
+  return _localDateTimeValue(nextHour);
+}
 
 String _referenceId(Map row) =>
     (row['id'] ??
