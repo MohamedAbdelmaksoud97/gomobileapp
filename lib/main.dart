@@ -6036,7 +6036,7 @@ const memberResourceFeatures = <ResourceFeature>[
   ),
   ResourceFeature(
     title: 'الخدمات المتاحة',
-    subtitle: 'الخدمات الرياضية والتشغيلية المتاحة للحجز',
+    subtitle: 'شراء خدمة وإصدار فاتورة؛ لحجز موعد استخدم حجز موعد',
     path: '/self/organizations/{organizationId}/services',
     icon: Icons.sports_gymnastics_outlined,
     fields: [
@@ -6058,8 +6058,8 @@ const memberResourceFeatures = <ResourceFeature>[
     ],
   ),
   ResourceFeature(
-    title: 'الحصص والمرافق',
-    subtitle: 'الموارد النشطة القابلة للحجز في الفرع',
+    title: 'حجز موعد',
+    subtitle: 'اختر المورد ثم موعدًا متاحًا أو فترة حجز الملعب',
     path: '/self/organizations/{organizationId}/bookable-resources',
     icon: Icons.event_available_outlined,
     fields: [
@@ -7645,18 +7645,7 @@ class MemberShell extends StatelessWidget {
   Widget build(BuildContext context) {
     final pages = [
       MemberHomePage(controller: controller),
-      MemberHubPage(
-        controller: controller,
-        title: 'اكتشف واحجز',
-        subtitle: 'الباقات والخدمات والمواعيد وقائمة اليوم في مكان واحد.',
-        features: [
-          memberResourceFeatures[10],
-          memberResourceFeatures[11],
-          memberResourceFeatures[12],
-          memberResourceFeatures[13],
-          memberResourceFeatures[14],
-        ],
-      ),
+      MemberMarketplacePage(controller: controller),
       MemberHubPage(
         controller: controller,
         title: 'عضويتي',
@@ -7905,6 +7894,334 @@ class MemberHomePage extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+class MemberMarketplacePage extends StatefulWidget {
+  const MemberMarketplacePage({
+    super.key,
+    required this.controller,
+    this.standalone = false,
+    this.initialTab,
+  });
+  final GoController controller;
+  final bool standalone;
+  final String? initialTab;
+
+  @override
+  State<MemberMarketplacePage> createState() => _MemberMarketplacePageState();
+}
+
+class _MemberMarketplacePageState extends State<MemberMarketplacePage> {
+  List<Map<String, dynamic>> items = [];
+  late String tab;
+  bool loading = true;
+  String? error;
+  int generation = 0;
+  String loadedContext = '';
+
+  String get contextKey =>
+      '${widget.controller.organizationId}:${widget.controller.branchId}:${widget.controller.selectedMemberId}';
+
+  @override
+  void didUpdateWidget(covariant MemberMarketplacePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (loadedContext != contextKey) {
+      if (!tabs.contains(tab)) tab = tabs.firstOrNull ?? 'booking';
+      unawaited(load());
+    }
+  }
+
+  List<String> get tabs => [
+    if (widget.controller.selectedSelfMember?['canManageMembership'] ==
+        true) ...[
+      'packages',
+      'services',
+    ],
+    if (widget.controller.selectedSelfMember?['canBook'] == true) 'booking',
+  ];
+
+  String label(String value) => switch (value) {
+    'packages' => 'الباقات',
+    'services' => 'الخدمات',
+    _ => 'حجز موعد',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    tab = tabs.contains(widget.initialTab)
+        ? widget.initialTab!
+        : tabs.firstOrNull ?? 'booking';
+    unawaited(load());
+  }
+
+  Future<void> load() async {
+    final current = ++generation;
+    loadedContext = contextKey;
+    setState(() {
+      loading = true;
+      error = null;
+      items = [];
+    });
+    if (!tabs.contains(tab)) {
+      setState(() => loading = false);
+      return;
+    }
+    try {
+      final suffix = tab == 'booking' ? 'bookable-resources' : tab;
+      final data = await widget.controller.api.request(
+        '/self/organizations/${widget.controller.organizationId}/$suffix',
+        query: {'branchId': widget.controller.branchId},
+      );
+      final raw = data is List
+          ? data
+          : data is Map
+          ? data['items']
+          : null;
+      if (!mounted || current != generation) return;
+      setState(() {
+        items = raw is List
+            ? raw.whereType<Map>().map(Map<String, dynamic>.from).toList()
+            : [];
+        loading = false;
+      });
+    } catch (exception) {
+      if (!mounted || current != generation) return;
+      setState(() {
+        error = _errorMessage(exception);
+        loading = false;
+      });
+    }
+  }
+
+  Future<void> choose(Map<String, dynamic> item) async {
+    final controller = widget.controller;
+    final operation = switch (tab) {
+      'packages' => 'checkoutSelfMemberPackage',
+      'services' => 'checkoutSelfService',
+      _ => 'checkoutSelfBooking',
+    };
+    final base = _workflowById(operation);
+    if (!_canRunWorkflow(controller, base)) return;
+    final id = item['id']?.toString() ?? '';
+    final type =
+        item['resourceType']?.toString() ?? item['type']?.toString() ?? '';
+    final serviceId = item['serviceId']?.toString() ?? '';
+    if (id.isEmpty ||
+        (tab == 'booking' &&
+            (serviceId.isEmpty ||
+                !const [
+                  'COURT',
+                  'CLASS',
+                  'PERSONAL_TRAINING',
+                  'APPOINTMENT',
+                ].contains(type)))) {
+      setState(
+        () => error =
+            'هذا الخيار غير مرتبط ببيانات صالحة للحجز. راجع استقبال النادي.',
+      );
+      return;
+    }
+    final selectedTab = tab;
+    final primaryField = selectedTab == 'packages'
+        ? 'packageId'
+        : selectedTab == 'services'
+        ? 'serviceId'
+        : 'resourceId';
+    final selectedMember = controller.selectedMemberId ?? '';
+    final organization = controller.organizationId;
+    final branch = controller.branchId;
+    final workflow = MobileWorkflow(
+      operationId: base.operationId,
+      title: base.title,
+      description: selectedTab == 'booking'
+          ? type == 'COURT'
+                ? 'احجز الملعب كوحدة واحدة داخل ساعات إتاحته. عدد المشاركين للتشغيل والتقارير فقط.'
+                : 'اختر موعدًا شاغرًا خلال الثلاثين يومًا القادمة. الحجز لمقعد واحد ويُؤكد بعد السداد في الاستقبال.'
+          : selectedTab == 'services'
+          ? 'شراء خدمة فقط وليس حجز موعد. راجع السعر النهائي قبل إصدار الفاتورة، ثم اسدد في الاستقبال.'
+          : base.description,
+      submitLabel: selectedTab == 'booking'
+          ? 'تأكيد الحجز'
+          : 'عرض السعر النهائي',
+      successMessage: selectedTab == 'booking'
+          ? 'تم تسجيل الحجز والفاتورة. يرجى السداد في استقبال النادي لتأكيد الموعد.'
+          : 'تم تسجيل الطلب والفاتورة. يرجى السداد في استقبال النادي لإتمام الاشتراك أو الخدمة.',
+      method: base.method,
+      path: base.path
+          .replaceAll('{organizationId}', organization)
+          .replaceAll('{memberId}', selectedMember),
+      icon: base.icon,
+      fields: base.fields,
+      body: (values, currentController) {
+        final body = base.body(values, currentController);
+        body['sellingBranchId'] = branch;
+        if (selectedTab == 'packages') {
+          for (final line in body['lines'] as List) {
+            line['accessBranchId'] = branch;
+          }
+        }
+        return body;
+      },
+    );
+    final saved = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => WorkflowPage(
+          controller: controller,
+          workflow: workflow,
+          selectionLabel:
+              '${item['name'] ?? item['code'] ?? label(selectedTab)} • ${controller.branchName}',
+          initialValues: {
+            primaryField: id,
+            if (selectedTab == 'booking') ...{
+              'serviceId': serviceId,
+              'resourceType': type,
+            },
+          },
+          lockedFields: {primaryField},
+        ),
+      ),
+    );
+    if (saved != true || !mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(workflow.successMessage)));
+    await load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final body = PageFrame(
+      title: 'اكتشف واحجز',
+      subtitle:
+          'الخيارات المنشورة في ${widget.controller.branchName}. شراء خدمة لا يحجز موعدًا؛ استخدم تبويب حجز موعد للحصص والملاعب.',
+      onRefresh: load,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (tabs.isNotEmpty)
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: tabs
+                    .map(
+                      (value) => Padding(
+                        padding: const EdgeInsetsDirectional.only(end: 8),
+                        child: ChoiceChip(
+                          label: Text(label(value)),
+                          selected: tab == value,
+                          onSelected: (_) {
+                            if (tab != value) {
+                              tab = value;
+                              unawaited(load());
+                            }
+                          },
+                        ),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
+          const SizedBox(height: 18),
+          if (loading)
+            const Center(child: CircularProgressIndicator())
+          else if (error != null)
+            _ResourceMessage(
+              icon: Icons.cloud_off_outlined,
+              title: 'تعذر تحميل الخيارات',
+              body: error!,
+              action: load,
+            )
+          else if (tabs.isEmpty)
+            const _ResourceMessage(
+              icon: Icons.lock_outline,
+              title: 'لا توجد صلاحية لإنشاء طلب أو حجز',
+              body: 'يمكنك متابعة بيانات العضوية. راجع النادي لمنح صلاحيات الحجز أو إدارة العضوية.',
+            )
+          else if (items.isEmpty)
+            const _ResourceMessage(
+              icon: Icons.event_busy_outlined,
+              title: 'لا توجد خيارات منشورة في هذا الفرع',
+              body: 'اختر فرعًا آخر أو راجع استقبال النادي.',
+            )
+          else
+            ...items.map(
+              (item) => Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                child: Padding(
+                  padding: const EdgeInsets.all(18),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        '${item['name'] ?? item['code'] ?? 'خيار متاح'}',
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '${item['description'] ?? item['facilityName'] ?? item['categoryName'] ?? label(tab)}',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      if (item['amountMinor'] != null)
+                        Text(
+                          _money(item['amountMinor']),
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                      if (tab == 'packages' && item['durationDays'] != null)
+                        Text(
+                          'المدة: ${item['durationDays']} يوم${item['visitAllowance'] != null ? ' • ${item['visitAllowance']} زيارة' : ''}',
+                        ),
+                      if (tab == 'packages' &&
+                          item['contract'] is Map &&
+                          (item['contract'] as Map)['content'] != null)
+                        ExpansionTile(
+                          tilePadding: EdgeInsets.zero,
+                          title: Text(
+                            '${(item['contract'] as Map)['title'] ?? 'عقد الاشتراك'}',
+                          ),
+                          children: [
+                            Text(
+                              '${(item['contract'] as Map)['content']}',
+                              style: const TextStyle(height: 1.7),
+                            ),
+                          ],
+                        ),
+                      const SizedBox(height: 14),
+                      FilledButton.tonalIcon(
+                        onPressed: () => unawaited(choose(item)),
+                        icon: Icon(
+                          tab == 'booking'
+                              ? Icons.event_available_outlined
+                              : Icons.shopping_bag_outlined,
+                        ),
+                        label: Text(
+                          tab != 'booking'
+                              ? 'عرض السعر النهائي'
+                              : (item['resourceType'] ?? item['type']) ==
+                                    'COURT'
+                              ? 'اختيار وقت الحجز'
+                              : 'عرض المواعيد المتاحة',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+    return widget.standalone
+        ? Scaffold(
+            appBar: AppBar(title: const Text('اكتشف واحجز')),
+            body: body,
+          )
+        : body;
   }
 }
 
@@ -10735,7 +11052,23 @@ void _openResource(
 }) {
   Navigator.of(context).push(
     MaterialPageRoute<void>(
-      builder: (_) => feature.path.endsWith('/daily-menu')
+      builder: (_) =>
+          feature.path.startsWith('/self/') &&
+              const [
+                'services',
+                'packages',
+                'bookable-resources',
+              ].contains(feature.path.split('/').last)
+          ? MemberMarketplacePage(
+              controller: controller,
+              standalone: true,
+              initialTab: feature.path.endsWith('/services')
+                  ? 'services'
+                  : feature.path.endsWith('/packages')
+                  ? 'packages'
+                  : 'booking',
+            )
+          : feature.path.endsWith('/daily-menu')
           ? MemberDailyMenuPage(controller: controller)
           : feature.path.endsWith('/barcode')
           ? MemberBarcodePage(controller: controller)
@@ -18157,9 +18490,15 @@ class WorkflowPage extends StatefulWidget {
     super.key,
     required this.controller,
     required this.workflow,
+    this.initialValues = const {},
+    this.lockedFields = const {},
+    this.selectionLabel,
   });
   final GoController controller;
   final MobileWorkflow workflow;
+  final Map<String, String> initialValues;
+  final Set<String> lockedFields;
+  final String? selectionLabel;
 
   @override
   State<WorkflowPage> createState() => _WorkflowPageState();
@@ -18194,6 +18533,9 @@ class _WorkflowPageState extends State<WorkflowPage> {
       }
       controllers[field.name] = TextEditingController(text: initial);
     }
+    for (final entry in widget.initialValues.entries) {
+      controllers[entry.key]?.text = entry.value;
+    }
     if (widget.workflow.operationId == 'createManualReservation' &&
         !widget.controller.can('sales.checkout')) {
       controllers['billingMode']?.text = 'OPERATIONAL';
@@ -18221,6 +18563,7 @@ class _WorkflowPageState extends State<WorkflowPage> {
   }
 
   bool _isVisible(WorkflowField field) {
+    if (widget.lockedFields.contains(field.name)) return false;
     if (field.type == WorkflowFieldType.hidden) return false;
     if (field.visibleWhenField == null) return true;
     final value = controllers[field.visibleWhenField]?.text ?? '';
@@ -18231,8 +18574,9 @@ class _WorkflowPageState extends State<WorkflowPage> {
     try {
       for (final field in widget.workflow.fields.where(
         (item) =>
-            item.type == WorkflowFieldType.reference ||
-            item.type == WorkflowFieldType.multiReference,
+            !widget.lockedFields.contains(item.name) &&
+            (item.type == WorkflowFieldType.reference ||
+                item.type == WorkflowFieldType.multiReference),
       )) {
         await _loadReference(field);
       }
@@ -18243,6 +18587,11 @@ class _WorkflowPageState extends State<WorkflowPage> {
   }
 
   Future<void> _loadReference(WorkflowField field) async {
+    if (field.name == 'sessionSlotId' &&
+        controllers['resourceType']?.text == 'COURT') {
+      references[field.name] = [];
+      return;
+    }
     if (field.referencePath == null) return;
     final path = _resolve(field.referencePath!);
     if (path.contains(RegExp(r'\{[^}]+\}'))) {
@@ -18269,6 +18618,16 @@ class _WorkflowPageState extends State<WorkflowPage> {
     if (widget.workflow.operationId == 'createSessionSlot' &&
         field.name == 'resourceId') {
       rows = rows.where((row) => row['type']?.toString() != 'COURT').toList();
+    }
+    if (widget.workflow.operationId == 'checkoutSelfBooking' &&
+        field.name == 'sessionSlotId') {
+      rows = rows.where((row) {
+        final available = num.tryParse(
+          '${row['availableCount'] ?? row['remainingCapacity'] ?? ''}',
+        );
+        return (row['status'] == null || row['status'] == 'OPEN') &&
+            (available == null || available > 0);
+      }).toList();
     }
     references[field.name] = rows
         .map((row) => Map<String, dynamic>.from(row))
@@ -18527,6 +18886,48 @@ class _WorkflowPageState extends State<WorkflowPage> {
       }
     }
     Map<String, dynamic>? bookingQuote;
+    if (const [
+      'checkoutSelfBooking',
+      'checkoutSelfService',
+      'checkoutSelfMemberPackage',
+    ].contains(widget.workflow.operationId)) {
+      if (!_canRunWorkflow(widget.controller, widget.workflow)) {
+        setState(
+          () => error = 'ليس لديك صلاحية لتنفيذ هذا الطلب للعضو الحالي.',
+        );
+        return;
+      }
+      setState(() {
+        saving = true;
+        error = null;
+      });
+      try {
+        final isPackage =
+            widget.workflow.operationId == 'checkoutSelfMemberPackage';
+        final quote = await widget.controller.api.request(
+          '/self/organizations/${widget.controller.organizationId}/quotes',
+          method: 'POST',
+          body: {
+            'branchId': widget.controller.branchId,
+            'targetType': isPackage ? 'PACKAGE' : 'SERVICE',
+            'targetId': values[isPackage ? 'packageId' : 'serviceId'],
+            'quantity': 1,
+            'memberId': widget.controller.selectedMemberId,
+            if ((values['promoCode'] ?? '').isNotEmpty)
+              'promoCode': values['promoCode'],
+          },
+        );
+        if (quote is! Map || quote['grossMinor'] == null) {
+          throw Exception('تعذر التحقق من السعر النهائي. حاول مرة أخرى.');
+        }
+        bookingQuote = Map<String, dynamic>.from(quote);
+      } catch (exception) {
+        if (mounted) setState(() => error = _errorMessage(exception));
+        return;
+      } finally {
+        if (mounted) setState(() => saving = false);
+      }
+    }
     if (widget.workflow.operationId == 'createManualReservation') {
       setState(() {
         saving = true;
@@ -18581,12 +18982,41 @@ class _WorkflowPageState extends State<WorkflowPage> {
       context: context,
       builder: (context) => AlertDialog(
         title: Text(widget.workflow.title),
-        content: audiencePreview == null
-            ? Text(
-                bookingQuote == null
-                    ? 'راجع البيانات قبل إرسالها إلى نظام الإنتاج.'
-                    : 'سيُنشأ الحجز مع فاتورة بقيمة ${_money(bookingQuote['grossMinor'] ?? 0)}، ويظل بانتظار التحصيل حتى يتم الدفع.',
+        content: bookingQuote != null
+            ? SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (widget.selectionLabel != null)
+                      Text(
+                        widget.selectionLabel!,
+                        style: const TextStyle(fontWeight: FontWeight.w900),
+                      ),
+                    if (bookingQuote['netMinor'] != null)
+                      Text(
+                        'الصافي قبل الضريبة: ${_money(bookingQuote['netMinor'])}',
+                      ),
+                    if (bookingQuote['taxMinor'] != null)
+                      Text('الضريبة: ${_money(bookingQuote['taxMinor'])}'),
+                    const Divider(),
+                    Text(
+                      'الإجمالي: ${_money(bookingQuote['grossMinor'])}',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'سيُنشأ الطلب والفاتورة. يرجى السداد في استقبال النادي لإتمام الاشتراك أو الخدمة أو تأكيد الموعد.',
+                      style: TextStyle(height: 1.6),
+                    ),
+                  ],
+                ),
               )
+            : audiencePreview == null
+            ? Text('راجع البيانات قبل إرسالها إلى نظام الإنتاج.')
             : Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -18919,6 +19349,13 @@ class _WorkflowPageState extends State<WorkflowPage> {
             ),
           ),
           const SizedBox(height: 18),
+          if (widget.selectionLabel != null) ...[
+            Text(
+              widget.selectionLabel!,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
+            ),
+            const SizedBox(height: 16),
+          ],
           if (loadingReferences)
             const LinearProgressIndicator()
           else
@@ -19203,6 +19640,10 @@ String _referenceId(Map row) =>
         .toString();
 
 String _referenceLabel(Map<String, dynamic> row, WorkflowField field) {
+  if (field.name == 'sessionSlotId' && row['startsAt'] != null) {
+    final available = row['availableCount'] ?? row['remainingCapacity'];
+    return '${_displayValue('startsAt', row['startsAt'])}${available != null ? ' • متاح $available' : ''}';
+  }
   String first(List<String> keys) => keys
       .map((key) => row[key]?.toString() ?? '')
       .firstWhere((value) => value.isNotEmpty, orElse: () => '');
@@ -20568,7 +21009,20 @@ MobileWorkflow _workflowById(String operationId) => mobileWorkflows
 
 bool _canRunWorkflow(GoController controller, MobileWorkflow workflow) {
   if (workflow.path.startsWith('/self/')) {
-    if (workflow.path.contains('/members/{memberId}/')) {
+    if (workflow.operationId == 'checkoutSelfBooking') {
+      return !controller.staffMode &&
+          controller.selectedMemberId != null &&
+          controller.selectedSelfMember?['canBook'] == true;
+    }
+    if (const [
+      'checkoutSelfService',
+      'checkoutSelfMemberPackage',
+    ].contains(workflow.operationId)) {
+      return !controller.staffMode &&
+          controller.selectedMemberId != null &&
+          controller.selectedSelfMember?['canManageMembership'] == true;
+    }
+    if (workflow.path.contains('/members/')) {
       return !controller.staffMode;
     }
     return controller.staffMode;

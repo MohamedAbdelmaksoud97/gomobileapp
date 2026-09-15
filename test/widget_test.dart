@@ -28,6 +28,16 @@ class _RecordingApiClient extends ApiClient {
         {'id': 'member-1', 'name': 'عضو تجريبي'},
       ];
     }
+    if (path.endsWith('/services')) {
+      return [
+        {'id': 'service-1', 'name': 'خدمة تجريبية'},
+      ];
+    }
+    if (path.endsWith('/packages')) {
+      return [
+        {'id': 'package-1', 'name': 'باقة تجريبية'},
+      ];
+    }
     if (path.endsWith('/bookable-resources')) {
       final memberPath = path.startsWith('/self/');
       return [
@@ -242,7 +252,7 @@ void main() {
       );
       await tester.tap(find.text('متابعة إنشاء الحجز'));
       await tester.pumpAndSettle();
-      expect(find.textContaining('فاتورة بقيمة'), findsOneWidget);
+      expect(find.textContaining('الإجمالي:'), findsOneWidget);
       await tester.tap(find.text('تأكيد'));
       await tester.pumpAndSettle();
 
@@ -272,7 +282,7 @@ void main() {
       ..organizationId = 'organization-1'
       ..branchId = 'branch-1'
       ..selfMembers = [
-        {'memberId': 'member-1', 'memberName': 'عضو تجريبي'},
+        {'memberId': 'member-1', 'memberName': 'عضو تجريبي', 'canBook': true},
       ];
     final workflow = mobileWorkflows.firstWhere(
       (item) => item.operationId == 'checkoutSelfBooking',
@@ -311,6 +321,165 @@ void main() {
     expect(booking['sessionSlotId'], 'slot-1');
     controller.dispose();
   });
+
+  for (final booking in [false, true]) {
+    testWidgets(
+      'member marketplace ${booking ? 'booking' : 'service'} binds the selected item to its order',
+      (tester) async {
+        tester.view.physicalSize = const Size(412, 915);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        final api = _RecordingApiClient();
+        final controller = GoController(api)
+          ..staffMode = false
+          ..organizationId = 'organization-1'
+          ..branchId = 'branch-1'
+          ..selfMembers = [
+            {
+              'memberId': 'member-1',
+              'canBook': true,
+              'canManageMembership': true,
+            },
+          ];
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Directionality(
+              textDirection: TextDirection.rtl,
+              child: MemberMarketplacePage(
+                controller: controller,
+                standalone: true,
+                initialTab: booking ? 'booking' : 'services',
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('الإجراءات المتاحة'), findsNothing);
+        await tester.tap(
+          find.text(booking ? 'عرض المواعيد المتاحة' : 'عرض السعر النهائي'),
+        );
+        await tester.pumpAndSettle();
+        expect(
+          find.byType(DropdownButtonFormField<String>),
+          booking ? findsOneWidget : findsNothing,
+        );
+        await tester.tap(
+          find.text(booking ? 'تأكيد الحجز' : 'عرض السعر النهائي'),
+        );
+        await tester.pumpAndSettle();
+        expect(find.textContaining('السداد في استقبال النادي'), findsWidgets);
+        await tester.tap(find.text('تأكيد'));
+        await tester.pumpAndSettle();
+        final order = api.calls.lastWhere(
+          (call) => call['path'].toString().endsWith('/orders'),
+        );
+        final line = ((order['body'] as Map)['lines'] as List).single as Map;
+        expect(line['type'], booking ? 'BOOKING' : 'SERVICE');
+        expect(line['targetId'], 'service-1');
+        if (booking) {
+          expect((line['booking'] as Map)['resourceId'], 'resource-1');
+          expect((line['booking'] as Map)['sessionSlotId'], 'slot-1');
+          expect((line['booking'] as Map)['seats'], 1);
+        } else {
+          expect(line.containsKey('booking'), isFalse);
+        }
+        expect(
+          api.calls.any((call) => call['path'].toString().endsWith('/quotes')),
+          isTrue,
+        );
+        controller.dispose();
+      },
+    );
+  }
+
+  testWidgets(
+    'guardian booking-only access does not expose service purchases',
+    (tester) async {
+      final controller = GoController(_RecordingApiClient())
+        ..staffMode = false
+        ..selfMembers = [
+          {
+            'memberId': 'member-1',
+            'canBook': true,
+            'canManageMembership': false,
+          },
+        ];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: MemberMarketplacePage(controller: controller, standalone: true),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('حجز موعد'), findsOneWidget);
+      expect(find.text('الخدمات'), findsNothing);
+      expect(find.text('الباقات'), findsNothing);
+      expect(tester.takeException(), isNull);
+      controller.dispose();
+    },
+  );
+
+  testWidgets(
+    'member court booking reserves one unit with participant count and no session-slot request',
+    (tester) async {
+      final api = _RecordingApiClient();
+      final controller = GoController(api)
+        ..staffMode = false
+        ..organizationId = 'organization-1'
+        ..branchId = 'branch-1'
+        ..selfMembers = [
+          {'memberId': 'member-1', 'canBook': true},
+        ];
+      final start = DateTime.now().add(const Duration(days: 2));
+      await tester.pumpWidget(
+        MaterialApp(
+          home: WorkflowPage(
+            controller: controller,
+            workflow: mobileWorkflows.firstWhere(
+              (item) => item.operationId == 'checkoutSelfBooking',
+            ),
+            lockedFields: const {'resourceId'},
+            initialValues: {
+              'resourceId': 'court-1',
+              'resourceType': 'COURT',
+              'serviceId': 'service-1',
+              'participantCount': '8',
+              'startsAt': start.toIso8601String(),
+              'endsAt': start.add(const Duration(hours: 1)).toIso8601String(),
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        api.calls.any(
+          (call) => call['path'].toString().endsWith('/session-slots'),
+        ),
+        isFalse,
+      );
+      await tester.scrollUntilVisible(
+        find.text('تأكيد الحجز'),
+        300,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.text('تأكيد الحجز'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('تأكيد'));
+      await tester.pumpAndSettle();
+      final order = api.calls.lastWhere(
+        (call) => call['path'].toString().endsWith('/orders'),
+      );
+      final line = ((order['body'] as Map)['lines'] as List).single as Map;
+      final booking = line['booking'] as Map;
+      expect(line['type'], 'BOOKING');
+      expect(line['quantity'], 1);
+      expect(booking['seats'], 1);
+      expect(booking['participantCount'], 8);
+      expect(booking['resourceId'], 'court-1');
+      expect(booking.containsKey('sessionSlotId'), isFalse);
+      controller.dispose();
+    },
+  );
 
   testWidgets('GO login experience renders', (tester) async {
     tester.view.physicalSize = const Size(400, 850);
@@ -379,7 +548,10 @@ void main() {
     final controller = GoController(ApiClient(baseUrl: ''))
       ..bootstrapping = false
       ..authenticated = true
-      ..staffMode = false;
+      ..staffMode = false
+      ..selfMembers = [
+        {'memberId': 'member-1', 'canBook': true, 'canManageMembership': true},
+      ];
 
     await tester.pumpWidget(
       MaterialApp(
@@ -406,8 +578,9 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(find.text('اكتشف واحجز'), findsOneWidget);
-    expect(find.text('الباقات المتاحة'), findsOneWidget);
-    expect(find.text('الخدمات المتاحة'), findsOneWidget);
+    expect(find.text('الباقات'), findsOneWidget);
+    expect(find.text('الخدمات'), findsOneWidget);
+    expect(find.text('حجز موعد'), findsOneWidget);
     expect(tester.takeException(), isNull);
     controller.dispose();
   });
